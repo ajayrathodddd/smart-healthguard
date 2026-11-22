@@ -11,7 +11,9 @@ import {
 } from "lucide-react";
 import "./AIAssistantPage.css";
 
-const API_URL = "http://127.0.0.1:8000/api/ai-assistant/chat";
+const API_URL = `${
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
+}/api/ai-assistant/chat`;
 
 function AIAssistantPage() {
   const [messages, setMessages] = useState([

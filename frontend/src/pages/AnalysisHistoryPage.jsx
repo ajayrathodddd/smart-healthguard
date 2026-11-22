@@ -16,7 +16,9 @@ import {
 
 import "./AnalysisHistoryPage.css";
 import { auth } from "../firebase";
-const API_URL = "http://127.0.0.1:8000/api/history/";
+const API_URL = `${
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000"
+}/api/history/`;
 
 function formatDate(value) {
   if (!value) return "Date unavailable";

@@ -1,4 +1,5 @@
 
+import os
 from pathlib import Path
 
 import firebase_admin
@@ -9,10 +10,15 @@ def initialize_firebase():
     try:
         return firebase_admin.get_app()
     except ValueError:
-        service_account_path = (
-            Path(__file__).resolve().parents[2]
-            / "secrets"
-            / "firebase-service-account.json"
+        service_account_path = Path(
+            os.getenv(
+                "FIREBASE_SERVICE_ACCOUNT_PATH",
+                str(
+                    Path(__file__).resolve().parents[2]
+                    / "secrets"
+                    / "firebase-service-account.json"
+                ),
+            )
         )
 
         if not service_account_path.exists():
@@ -31,4 +37,3 @@ def initialize_firebase():
 
 
 firebase_app = initialize_firebase()
-
