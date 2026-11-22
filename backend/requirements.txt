@@ -25,3 +25,5 @@ pypdf==7.1.1
 gTTS
 
 googletrans==4.0.2
+
+edge-tts
