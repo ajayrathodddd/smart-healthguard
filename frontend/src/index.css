@@ -1,0 +1,342 @@
+@import "tailwindcss";
+
+/* ============================================================
+   SMART HEALTHGUARD
+   Global stylesheet for OCRScannerPage.jsx
+   Tailwind CSS v4
+   ============================================================ */
+
+:root {
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+
+  color: #e2e8f0;
+  background: #020617;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ============================================================
+   RESET
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #020617;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+
+  background:
+    radial-gradient(
+      circle at 10% 0%,
+      rgba(6, 182, 212, 0.08),
+      transparent 28%
+    ),
+    radial-gradient(
+      circle at 90% 10%,
+      rgba(59, 130, 246, 0.07),
+      transparent 30%
+    ),
+    #020617;
+
+  color: #e2e8f0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+img,
+video {
+  display: block;
+  max-width: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ============================================================
+   ROOT
+   IMPORTANT:
+   Do NOT constrain #root to a fixed width.
+   ============================================================ */
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
+
+/* ============================================================
+   TEXT SELECTION
+   ============================================================ */
+
+::selection {
+  background: rgba(34, 211, 238, 0.25);
+  color: #f8fafc;
+}
+
+/* ============================================================
+   SCROLLBAR
+   ============================================================ */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #020617;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid #020617;
+  border-radius: 999px;
+  background: #334155;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* ============================================================
+   FORM ELEMENTS
+   ============================================================ */
+
+input,
+textarea,
+select {
+  outline: none;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+}
+
+/* Better native select appearance */
+select {
+  color-scheme: dark;
+}
+
+select option {
+  background: #0f172a;
+  color: #f8fafc;
+}
+
+/* ============================================================
+   IMAGE / VIDEO BEHAVIOR
+   ============================================================ */
+
+img {
+  user-select: none;
+}
+
+video {
+  background: #000;
+}
+
+/* ============================================================
+   OCR IMAGE PREVIEW
+   ============================================================ */
+
+img[alt="Selected medicine package"],
+img[alt="Scanned medicine package"] {
+  min-height: 180px;
+  max-height: 500px;
+  object-fit: contain;
+}
+
+/* ============================================================
+   CAMERA
+   ============================================================ */
+
+video {
+  min-height: 260px;
+  max-height: 600px;
+  width: 100%;
+  object-fit: contain;
+}
+
+/* ============================================================
+   SMOOTH INTERACTIONS
+   ============================================================ */
+
+button,
+label,
+a,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+label {
+  transition:
+    background-color 180ms ease,
+    border-color 180ms ease,
+    box-shadow 180ms ease,
+    color 180ms ease,
+    transform 180ms ease,
+    opacity 180ms ease;
+}
+
+/* ============================================================
+   ACCESSIBILITY
+   ============================================================ */
+
+:focus-visible {
+  outline: 2px solid #22d3ee;
+  outline-offset: 2px;
+}
+
+/* ============================================================
+   OCR RESULT TEXT
+   ============================================================ */
+
+.whitespace-pre-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* ============================================================
+   ANIMATIONS
+   ============================================================ */
+
+@keyframes healthguard-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes healthguard-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* ============================================================
+   OCR PAGE SECTIONS
+   ============================================================ */
+
+main > section {
+  animation: healthguard-fade-in 0.35s ease both;
+}
+
+main > section:nth-child(2) {
+  animation-delay: 60ms;
+}
+
+/* ============================================================
+   REDUCED MOTION
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   MOBILE
+   ============================================================ */
+
+@media (max-width: 640px) {
+  body {
+    overflow-x: hidden;
+  }
+
+  #root {
+    overflow-x: hidden;
+  }
+
+  video {
+    min-height: 220px;
+  }
+
+  img[alt="Selected medicine package"],
+  img[alt="Scanned medicine package"] {
+    min-height: 140px;
+    max-height: 360px;
+  }
+}
+
+/* ============================================================
+   TABLET
+   ============================================================ */
+
+@media (min-width: 641px) and (max-width: 1024px) {
+  video {
+    min-height: 300px;
+  }
+}
+
+/* ============================================================
+   PRINT
+   ============================================================ */
+
+@media print {
+  body {
+    background: white;
+    color: black;
+  }
+
+  #root {
+    background: white;
+  }
+
+  button,
+  input,
+  select {
+    display: none !important;
+  }
+}

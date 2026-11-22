@@ -1,0 +1,157 @@
+﻿import io
+import re
+
+from PIL import Image, ImageEnhance, ImageOps
+import pytesseract
+
+
+def _prepare_image(image):
+    image = ImageOps.grayscale(image)
+
+    width, height = image.size
+    largest = max(width, height)
+
+    if largest > 2200:
+        scale = 2200 / largest
+        image = image.resize(
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+
+    contrast = ImageEnhance.Contrast(image).enhance(1.8)
+    sharp = ImageEnhance.Sharpness(contrast).enhance(2.0)
+    threshold = sharp.point(lambda pixel: 255 if pixel > 155 else 0)
+
+    return [image, contrast, sharp, threshold]
+
+
+def _run_ocr(image, config):
+    try:
+        return pytesseract.image_to_string(
+            image,
+            config=config,
+            timeout=12,
+        ).strip()
+    except Exception as error:
+        print("[HealthGuard OCR] Pass failed:", error)
+        return ""
+
+
+def _text_score(text):
+    return sum(character.isalnum() for character in text)
+
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    """
+    Best-effort OCR for supported medicine/package images.
+    Tries image enhancements and fallback rotations.
+    Never invents missing medicine information.
+    """
+
+    if not image_bytes:
+        return ""
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as uploaded:
+            uploaded.load()
+            image = ImageOps.exif_transpose(uploaded).convert("RGB")
+
+        if image.width * image.height > 25000000:
+            image.thumbnail((5000, 5000), Image.Resampling.LANCZOS)
+
+    except Exception as error:
+        print("[HealthGuard OCR] Image preparation failed:", error)
+        return ""
+
+    results = []
+    seen = set()
+
+    configurations = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 11",
+    ]
+
+    def process_orientation(current_image, orientation):
+        variants = _prepare_image(current_image)
+
+        for index, variant in enumerate(variants):
+            for config in configurations:
+                text = _run_ocr(variant, config)
+
+                normalized = re.sub(
+                    r"\s+",
+                    " ",
+                    text,
+                ).strip().lower()
+
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    results.append(text)
+
+                print(
+                    "[HealthGuard OCR] Orientation:",
+                    orientation,
+                    "Variant:",
+                    index + 1,
+                    "Characters:",
+                    len(text),
+                )
+
+    process_orientation(image, 0)
+
+    best_score = max(
+        (_text_score(text) for text in results),
+        default=0,
+    )
+
+    # Try alternate orientations when the initial result is weak.
+    if best_score < 35:
+        for angle in (90, 180, 270):
+            rotated = image.rotate(angle, expand=True)
+            process_orientation(rotated, angle)
+
+            best_score = max(
+                (_text_score(text) for text in results),
+                default=0,
+            )
+
+            if best_score >= 35:
+                break
+
+    if not results:
+        return ""
+
+    results.sort(
+        key=lambda text: (
+            _text_score(text),
+            len(text),
+        ),
+        reverse=True,
+    )
+
+    best = results[0]
+    combined = [best]
+    best_words = set(re.findall(r"[a-z0-9]+", best.lower()))
+
+    for candidate in results[1:]:
+        candidate_words = set(
+            re.findall(r"[a-z0-9]+", candidate.lower())
+        )
+
+        new_words = candidate_words - best_words
+
+        if len(new_words) >= 3:
+            combined.append(candidate)
+            best_words.update(candidate_words)
+
+        if len(combined) >= 3:
+            break
+
+    extracted = "\n\n".join(combined).strip()
+
+    print(
+        "[HealthGuard OCR] Final extracted characters:",
+        len(extracted),
+    )
+
+    return extracted

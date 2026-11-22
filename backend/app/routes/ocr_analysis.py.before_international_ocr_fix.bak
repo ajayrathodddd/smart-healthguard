@@ -1,0 +1,1742 @@
+﻿import asyncio
+import re
+
+from fastapi import APIRouter, File, UploadFile, HTTPException
+
+from app.services.ocr_service import extract_text_from_image
+from app.services.drug_information_service import (
+    get_real_medicine_information,
+    search_openfda,
+    merge_medicine_information,
+    normalize_ingredient_for_api,
+)
+router = APIRouter(
+    prefix="/api/ocr",
+    tags=["OCR Medicine Analysis"],
+)
+
+
+# ============================================================
+# OCR TEXT HELPERS
+# ============================================================
+
+def normalize_ocr_text(text: str) -> str:
+    """
+    Normalize OCR text for comparison.
+    """
+    if not text:
+        return ""
+
+    text = str(text).lower()
+    text = text.replace("Ã¢â‚¬â€œ", "-")
+    text = text.replace("Ã¢â‚¬â€", "-")
+    text = text.replace("_", " ")
+
+    text = re.sub(
+        r"[^a-z0-9.+\-/() ]",
+        " ",
+        text,
+    )
+
+    text = " ".join(text.split())
+
+    return text.strip()
+
+
+def clean_ocr_line(line: str) -> str:
+    """
+    Clean one OCR line while preserving medicine-like text.
+    """
+    if not line:
+        return ""
+
+    line = line.strip()
+
+    line = re.sub(
+        r"[^a-zA-Z0-9.+\-/() ]",
+        " ",
+        line,
+    )
+
+    line = " ".join(line.split())
+
+    return line.strip()
+
+
+def normalize_brand_identity(value: str) -> str:
+    """
+    Normalize a brand name for exact identity comparison.
+    A trailing package strength (for example Dolo-650) is removed;
+    substring matches are deliberately not accepted.
+    """
+    value = normalize_ocr_text(value or "")
+    value = re.sub(
+        r"[- ]\d{2,5}(?:\s*(?:mg|mcg|g|ml))?$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(value.split()).strip()
+
+
+# ============================================================
+# KNOWN GENERIC NAMES
+# ============================================================
+
+KNOWN_GENERIC_NAMES = [
+    "paracetamol",
+    "acetaminophen",
+    "ibuprofen",
+    "azithromycin",
+    "amoxicillin",
+    "cetirizine",
+    "metformin",
+    "omeprazole",
+]
+
+
+def extract_generic_name(ocr_text: str):
+    """
+    Extract a known generic medicine name from OCR text.
+    """
+    normalized = normalize_ocr_text(ocr_text)
+
+    for generic in KNOWN_GENERIC_NAMES:
+        if re.search(
+            rf"\b{re.escape(generic)}\b",
+            normalized,
+        ):
+            return generic.title()
+
+    return ""
+
+
+# ============================================================
+# STRENGTH EXTRACTION
+# ============================================================
+
+def extract_strength(ocr_text: str):
+    """
+    Extract medicine strength such as:
+
+    650 mg
+    500 mg
+    10 mg
+    5 ml
+
+    Also handles:
+
+    650mg
+    650 MG
+
+    And brand-number formats:
+
+    Waypee-650
+    Dolo-650
+    """
+
+    if not ocr_text:
+        return ""
+
+    normalized = normalize_ocr_text(ocr_text)
+
+    # --------------------------------------------------------
+    # Normal strength
+    # --------------------------------------------------------
+
+    match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+
+    if match:
+        value = match.group(1)
+        unit = match.group(2).lower()
+
+        return f"{value} {unit}"
+
+    # --------------------------------------------------------
+    # Brand-number fallback
+    #
+    # Waypee-650
+    # Dolo-650
+    # --------------------------------------------------------
+
+    brand_strength = re.search(
+        r"\b[a-z]{2,}[- ](\d{2,5})\b",
+        normalized,
+        re.IGNORECASE,
+    )
+
+    if brand_strength:
+        value = brand_strength.group(1)
+
+        return f"{value} mg"
+
+    return ""
+
+
+# ============================================================
+# DOSAGE FORM EXTRACTION
+# ============================================================
+
+def extract_dosage_form(ocr_text: str):
+    """
+    Identify basic dosage form from OCR.
+    """
+
+    normalized = normalize_ocr_text(ocr_text)
+
+    dosage_forms = [
+        ("tablet", "tablet"),
+        ("tablets", "tablet"),
+        ("capsule", "capsule"),
+        ("capsules", "capsule"),
+        ("syrup", "syrup"),
+        ("suspension", "suspension"),
+        ("injection", "injection"),
+        ("cream", "cream"),
+        ("ointment", "ointment"),
+        ("drops", "drops"),
+        ("drop", "drops"),
+        ("suppository", "suppository"),
+        ("suppositories", "suppository"),
+    ]
+
+    for keyword, form in dosage_forms:
+        if re.search(
+            rf"\b{re.escape(keyword)}\b",
+            normalized,
+        ):
+            return form
+
+    return ""
+
+
+# ============================================================
+# BRAND NAME EXTRACTION
+# ============================================================
+
+def extract_brand_name(ocr_text: str):
+    """
+    Try to identify a medicine brand from OCR.
+
+    Examples:
+
+    Waypee-650
+    Dolo-650
+    Azithral-500
+    Crocin-650
+    """
+
+    if not ocr_text:
+        return ""
+
+    lines = [
+        clean_ocr_line(line)
+        for line in ocr_text.splitlines()
+        if clean_ocr_line(line)
+    ]
+
+    ignored = {
+        "tablet",
+        "tablets",
+        "capsule",
+        "capsules",
+        "syrup",
+        "suspension",
+        "injection",
+        "cream",
+        "ointment",
+        "medicine",
+        "paracetamol",
+        "acetaminophen",
+        "ibuprofen",
+        "azithromycin",
+        "amoxicillin",
+        "cetirizine",
+        "metformin",
+        "omeprazole",
+    }
+
+    # --------------------------------------------------------
+    # First priority:
+    # Brand followed by strength.
+    #
+    # Waypee-650
+    # Dolo-650
+    # --------------------------------------------------------
+
+    for line in lines:
+        match = re.search(
+            r"\b([A-Za-z][A-Za-z0-9]{1,30})[- ](\d{2,5})\b",
+            line,
+        )
+
+        if match:
+            brand = match.group(1)
+            strength = match.group(2)
+
+            candidate = f"{brand}-{strength}"
+
+            if brand.lower() not in ignored:
+                return candidate
+
+    # --------------------------------------------------------
+    # Second priority:
+    # Short medicine-like line.
+    # --------------------------------------------------------
+
+    for line in lines:
+        normalized = normalize_ocr_text(line)
+
+        if not normalized:
+            continue
+
+        if normalized in ignored:
+            continue
+
+        # Skip lines that are clearly dosage information.
+        if re.fullmatch(
+            r"\d+(?:\.\d+)?\s*(mg|mcg|g|ml)",
+            normalized,
+        ):
+            continue
+
+        # Skip long sentences.
+        if len(line.split()) > 5:
+            continue
+
+        # Skip packaging words.
+        if any(
+            word in normalized
+            for word in [
+                "manufactured",
+                "composition",
+                "warning",
+                "dosage",
+                "prescription",
+                "healthcare",
+                "pharmaceutical",
+                "india",
+            ]
+        ):
+            continue
+
+        # Medicine-like alphanumeric name.
+        if re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9.+\-/]{2,40}",
+            line,
+        ):
+            return line
+
+    return ""
+
+
+# ============================================================
+# MEDICINE IDENTITY EXTRACTION
+# ============================================================
+
+def extract_medicine_identity(ocr_text: str):
+    """
+    Extract structured medicine identity from OCR.
+    """
+
+    return {
+        "brand_name": extract_brand_name(ocr_text),
+        "generic_name": extract_generic_name(ocr_text),
+        "strength": extract_strength(ocr_text),
+        "dosage_form": extract_dosage_form(ocr_text),
+    }
+
+
+# ============================================================
+# OCR CANDIDATES
+# ============================================================
+
+def extract_possible_medicine_names(
+    ocr_text: str,
+):
+    """
+    Find possible medicine names from OCR text.
+
+    These candidates are returned for UI/debugging,
+    but the matching system does NOT blindly search
+    all candidates.
+    """
+
+    if not ocr_text:
+        return []
+
+    lines = [
+        clean_ocr_line(line)
+        for line in ocr_text.splitlines()
+        if clean_ocr_line(line)
+    ]
+
+    candidates = []
+
+    ignored_words = {
+        "tablet",
+        "tablets",
+        "capsule",
+        "capsules",
+        "syrup",
+        "suspension",
+        "injection",
+        "cream",
+        "ointment",
+        "medicine",
+        "mg",
+        "ml",
+        "india",
+        "manufactured",
+        "manufactured by",
+        "composition",
+        "warning",
+        "dosage",
+        "prescription",
+        "for",
+        "oral",
+        "use",
+        "only",
+    }
+
+    for line in lines:
+        cleaned = line
+
+        if not cleaned:
+            continue
+
+        lower_line = normalize_ocr_text(cleaned)
+
+        if lower_line in ignored_words:
+            continue
+
+        if len(cleaned) > 80:
+            continue
+
+        words = cleaned.split()
+
+        if len(words) > 8:
+            continue
+
+        generic_words = [
+            "website",
+            "copyright",
+            "contact",
+            "newsletter",
+            "dashboard",
+            "home page",
+            "about page",
+            "get in touch",
+            "manufactured by",
+            "pharmaceuticals",
+        ]
+
+        if any(
+            phrase in lower_line
+            for phrase in generic_words
+        ):
+            continue
+
+        candidates.append(cleaned)
+
+    unique_candidates = []
+    seen = set()
+
+    for candidate in candidates:
+        key = normalize_ocr_text(candidate)
+
+        if not key:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique_candidates.append(candidate)
+
+    return unique_candidates[:20]
+
+
+# ============================================================
+# GENERIC NORMALIZATION
+# ============================================================
+
+GENERIC_ALIASES = {
+    "paracetamol": "acetaminophen",
+    "acetaminophen": "acetaminophen",
+}
+
+
+def normalize_generic_text(value):
+    """
+    Normalize generic medicine aliases.
+
+    Paracetamol and acetaminophen are treated as
+    equivalent active ingredients.
+    """
+
+    value = normalize_ocr_text(
+        str(value or "")
+    )
+
+    for alias, canonical in GENERIC_ALIASES.items():
+        value = re.sub(
+            rf"\b{re.escape(alias)}\b",
+            canonical,
+            value,
+            flags=re.IGNORECASE,
+        )
+
+    return value
+
+
+# ============================================================
+# STRENGTH HELPERS
+# ============================================================
+
+def extract_strength_value(strength: str):
+    """
+    Extract numeric strength and unit.
+
+    Example:
+
+    650 mg  -> ("650", "mg")
+    500mg   -> ("500", "mg")
+    """
+
+    if not strength:
+        return None, None
+
+    normalized = normalize_ocr_text(strength)
+
+    match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None, None
+
+    return (
+        match.group(1),
+        match.group(2).lower(),
+    )
+
+
+def profile_has_strength(
+    medicine: dict,
+    strength: str,
+):
+    """
+    Strictly verify OCR strength against actual medicine identity fields.
+    Never use matched_query or general descriptions as strength evidence.
+    """
+
+    if not medicine or not strength:
+        return False
+
+    requested_value, requested_unit = extract_strength_value(strength)
+
+    if not requested_value or not requested_unit:
+        return False
+
+    try:
+        requested_amount = float(requested_value)
+    except (TypeError, ValueError):
+        return False
+
+    # Only fields describing the medicine identity are allowed.
+    # matched_query is deliberately excluded because it contains
+    # the search text, not necessarily the database medicine strength.
+    database_fields = [
+        medicine.get("strength", ""),
+        medicine.get("generic_name", ""),
+        medicine.get("composition_2", ""),
+        medicine.get("active_ingredient", ""),
+        medicine.get("name", ""),
+        medicine.get("synonym", ""),
+    ]
+
+    pattern = r"(?<!\d)(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml)\b"
+
+    found_strengths = []
+
+    for field in database_fields:
+        if not field:
+            continue
+
+        matches = re.findall(
+            pattern,
+            normalize_ocr_text(str(field)),
+            re.IGNORECASE,
+        )
+
+        for amount, unit in matches:
+            try:
+                found_strengths.append(
+                    (float(amount), unit.lower())
+                )
+            except (TypeError, ValueError):
+                continue
+
+    # Missing database strength is NOT considered verified.
+    if not found_strengths:
+        return False
+
+    # Reject conflicting or different strengths.
+    return all(
+        amount == requested_amount and unit == requested_unit
+        for amount, unit in found_strengths
+    )
+
+
+# ============================================================
+# IDENTITY MATCHING
+# ============================================================
+
+def profile_matches_identity(
+    medicine: dict,
+    identity: dict,
+):
+    """
+    Validate OCR identity against medicine identity fields only.
+
+    Search text, descriptions, indications and precautions are not
+    independent proof of a medicine's generic ingredient or brand.
+    """
+
+    if not medicine:
+        return False
+
+    brand = identity.get("brand_name", "")
+    generic = identity.get("generic_name", "")
+    strength = identity.get("strength", "")
+    dosage_form = identity.get("dosage_form", "")
+
+    # Only identity-bearing fields may verify a generic ingredient.
+    generic_fields = [
+        medicine.get("generic_name", ""),
+        medicine.get("composition_2", ""),
+        medicine.get("active_ingredient", ""),
+        medicine.get("name", ""),
+        medicine.get("synonym", ""),
+    ]
+    generic_text = normalize_generic_text(
+        " ".join(str(value) for value in generic_fields if value)
+    )
+
+    generic_match = False
+    if generic:
+        normalized_generic = normalize_generic_text(generic)
+        generic_match = bool(
+            normalized_generic
+            and re.search(
+                rf"\b{re.escape(normalized_generic)}\b",
+                generic_text,
+            )
+        )
+
+    strength_match = (
+        profile_has_strength(medicine, strength)
+        if strength
+        else False
+    )
+
+    # Dosage form is verified from identity/form fields, not marketing text.
+    form_fields = [
+        medicine.get("dosage_form", ""),
+        medicine.get("medicine_type", ""),
+        medicine.get("name", ""),
+        medicine.get("synonym", ""),
+    ]
+    form_text = normalize_ocr_text(
+        " ".join(str(value) for value in form_fields if value)
+    )
+
+    dosage_match = False
+    if dosage_form:
+        normalized_dosage = normalize_ocr_text(dosage_form)
+        dosage_aliases = {
+            "tablet": ("tablet", "tablets"),
+            "capsule": ("capsule", "capsules"),
+            "syrup": ("syrup", "oral solution"),
+            "suspension": ("suspension", "oral suspension"),
+            "injection": ("injection", "injectable"),
+            "cream": ("cream",),
+            "ointment": ("ointment",),
+            "drops": ("drop", "drops"),
+            "suppository": ("suppository", "suppositories"),
+        }
+        possible_forms = dosage_aliases.get(
+            normalized_dosage,
+            (normalized_dosage,),
+        )
+        dosage_match = any(
+            re.search(rf"\b{re.escape(form)}\b", form_text)
+            for form in possible_forms
+        )
+
+    # A brand is verified only by an exact normalized database brand field.
+    database_brand = medicine.get("brand_name", "")
+    brand_match = bool(
+        brand
+        and normalize_brand_identity(brand)
+        and normalize_brand_identity(brand)
+        == normalize_brand_identity(database_brand)
+    )
+
+    print(
+        "[HealthGuard OCR] Verification:",
+        {
+            "ocr_brand": brand,
+            "ocr_generic": generic,
+            "ocr_strength": strength,
+            "ocr_dosage_form": dosage_form,
+            "brand_match": brand_match,
+            "generic_match": generic_match,
+            "strength_match": strength_match,
+            "dosage_match": dosage_match,
+            "database_brand": database_brand,
+            "database_generic": medicine.get("generic_name", ""),
+        },
+    )
+
+    if strength and not strength_match:
+        return False
+
+    if dosage_form and not dosage_match:
+        return False
+
+    # If OCR also detected a generic ingredient, a brand-name match
+    # cannot override a conflicting generic identity.
+    if brand and brand_match and generic and not generic_match:
+        return False
+
+    if brand and brand_match:
+        return True
+
+    # Generic verification requires ingredient AND exact strength.
+    if generic and strength:
+        return generic_match and strength_match
+
+    return False
+
+# ============================================================
+# SAFE GENERIC/STRENGTH RESULT
+# ============================================================
+
+async def build_generic_strength_verified_result(
+    medicine: dict,
+    identity: dict,
+):
+    """
+    Build a safe result after OCR independently verifies generic + strength.
+    Enrich ingredient-level details from openFDA without verifying the brand.
+    """
+
+    generic_name = identity.get("generic_name", "")
+    fda_profile = {}
+
+    if generic_name:
+        try:
+            fda_profile = await search_openfda(
+                normalize_ingredient_for_api(generic_name)
+            ) or {}
+        except Exception as error:
+            print("[HealthGuard] OCR openFDA enrichment failed:", error)
+
+    enriched = merge_medicine_information(
+        {},
+        medicine or {},
+        fda_profile,
+    )
+
+    return {
+        "brand_name": "",
+        "generic_name": generic_name,
+        "manufacturer": "",
+        "composition_2": generic_name,
+        "medicine_type": "",
+        "pack_size": "",
+        "price": "",
+        "is_discontinued": "",
+        "medicine_description": enriched.get("medicine_description", ""),
+        "description": enriched.get("medicine_description", ""),
+        "purpose": enriched.get("purpose", ""),
+        "indications": enriched.get("indications", ""),
+        "side_effects": enriched.get("side_effects", ""),
+        "adverse_reactions": enriched.get("adverse_reactions", ""),
+        "warnings": enriched.get("warnings", ""),
+        "contraindications": enriched.get("contraindications", ""),
+        "drug_interactions": enriched.get("drug_interactions", ""),
+        "dosage_form": identity.get("dosage_form", "") or enriched.get("dosage_form", ""),
+        "route": enriched.get("route", ""),
+        "dosage_and_administration": enriched.get("dosage_and_administration", ""),
+        "pregnancy": enriched.get("pregnancy", ""),
+        "storage": enriched.get("storage", ""),
+        "rxcui": medicine.get("rxcui", medicine.get("rxnorm_id", "")),
+        "rxnorm_id": medicine.get("rxnorm_id", medicine.get("rxcui", "")),
+        "sources": enriched.get("sources", medicine.get("sources", [])),
+        "source": enriched.get("source", medicine.get("source", [])),
+        "information_sources": enriched.get(
+            "information_sources",
+            medicine.get("information_sources", {}),
+        ),
+        "data_status": "generic_strength_verified_brand_unverified",
+        "match_score": medicine.get("match_score", 0),
+        "matched_query": medicine.get("matched_query", ""),
+        "active_ingredient": generic_name,
+        "ocr_brand_name": identity.get("brand_name", ""),
+        "ocr_generic_name": generic_name,
+        "ocr_strength": identity.get("strength", ""),
+        "ocr_dosage_form": identity.get("dosage_form", ""),
+        "ocr_match_type": "verified_generic_strength_brand_unverified",
+    }
+
+
+# ============================================================
+# EXACT GENERIC + STRENGTH LOOKUP
+# ============================================================
+
+async def find_exact_generic_strength_information(
+    generic: str,
+    strength: str,
+    dosage_form: str = "",
+):
+    """
+    OCR-only exact generic + strength lookup.
+
+    The normal medicine service may return a cached medicine
+    with the wrong strength. That result is NEVER accepted.
+
+    Example:
+
+        OCR -> Paracetamol 650 mg
+
+    Wrong:
+
+        Paracetamol 250 mg
+
+    Correct:
+
+        An RxNorm concept whose name/synonym contains
+        Paracetamol/Acetaminophen and 650 mg.
+    """
+
+    if not generic or not strength:
+        return None
+
+    generic = generic.strip()
+    strength = strength.strip()
+
+    strength_value, strength_unit = extract_strength_value(
+        strength
+    )
+
+    if not strength_value or not strength_unit:
+        print(
+            "[HealthGuard OCR] Could not parse exact strength:",
+            strength,
+        )
+        return None
+
+    requested_identity = f"{generic} {strength}"
+
+    print(
+        "[HealthGuard OCR] Exact generic-strength lookup:",
+        requested_identity,
+    )
+
+    # ========================================================
+    # Skip the full medicine service here.
+    # The brand lookup has already been attempted by the caller.
+    # Use direct RxNorm verification to avoid repeating expensive searches.
+
+    # STEP 2
+    # Direct RxNorm lookup
+    # ========================================================
+
+    try:
+        import httpx
+
+        rxnorm_base_url = (
+            "https://rxnav.nlm.nih.gov/REST"
+        )
+
+        async with httpx.AsyncClient(
+            timeout=6.0
+        ) as client:
+
+            rxnorm_candidates = []
+
+            # ------------------------------------------------
+            # 2A. Exact full-name lookup
+            # ------------------------------------------------
+
+            exact_response = await client.get(
+                f"{rxnorm_base_url}/rxcui.json",
+                params={
+                    "name": requested_identity,
+                },
+            )
+
+            if exact_response.status_code == 200:
+                exact_data = exact_response.json()
+
+                exact_ids = (
+                    exact_data
+                    .get("idGroup", {})
+                    .get("rxnormId", [])
+                )
+
+                if exact_ids:
+                    rxnorm_candidates.extend(
+                        str(rxcui)
+                        for rxcui in exact_ids
+                    )
+
+            # ------------------------------------------------
+            # 2B. Approximate full-name lookup
+            # ------------------------------------------------
+
+            approximate_response = await client.get(
+                f"{rxnorm_base_url}/approximateTerm.json",
+                params={
+                    "term": requested_identity,
+                    "maxEntries": 10,
+                },
+            )
+
+            if approximate_response.status_code == 200:
+                approximate_data = (
+                    approximate_response.json()
+                )
+
+                approximate_group = (
+                    approximate_data
+                    .get("approximateGroup", {})
+                )
+
+                approximate_candidates = (
+                    approximate_group.get(
+                        "candidate",
+                        [],
+                    )
+                )
+
+                for candidate in approximate_candidates:
+                    rxcui = candidate.get("rxcui")
+
+                    if rxcui:
+                        rxnorm_candidates.append(
+                            str(rxcui)
+                        )
+
+            # ------------------------------------------------
+            # Remove duplicate RxCUIs
+            # ------------------------------------------------
+
+            unique_rxcuis = []
+            seen_rxcuis = set()
+
+            for rxcui in rxnorm_candidates:
+                if rxcui in seen_rxcuis:
+                    continue
+
+                seen_rxcuis.add(rxcui)
+                unique_rxcuis.append(rxcui)
+
+            print(
+                "[HealthGuard OCR] RxNorm candidate RxCUIs:",
+                unique_rxcuis[:20],
+            )
+
+            # ------------------------------------------------
+            # STEP 3
+            # Inspect candidates
+            # ------------------------------------------------
+
+            candidate_ids = unique_rxcuis[:10]
+            semaphore = asyncio.Semaphore(5)
+
+            async def fetch_candidate_properties(rxcui):
+                async with semaphore:
+                    try:
+                        response = await client.get(
+                            f"{rxnorm_base_url}/rxcui/"
+                            f"{rxcui}/properties.json"
+                        )
+
+                        if response.status_code != 200:
+                            return None
+
+                        return response.json().get(
+                            "properties",
+                            {},
+                        )
+                    except Exception as error:
+                        print(
+                            "[HealthGuard OCR] RxNorm property request failed:",
+                            rxcui,
+                            error,
+                        )
+                        return None
+
+            candidate_properties = await asyncio.gather(
+                *(
+                    fetch_candidate_properties(rxcui)
+                    for rxcui in candidate_ids
+                )
+            )
+
+            for rxcui, properties in zip(
+                candidate_ids,
+                candidate_properties,
+            ):
+
+                try:
+                    if not properties:
+                        continue
+
+                    name = str(
+                        properties.get(
+                            "name",
+                            "",
+                        )
+                    )
+
+                    synonym = str(
+                        properties.get(
+                            "synonym",
+                            "",
+                        )
+                    )
+
+                    searchable_text = normalize_ocr_text(
+                        f"{name} {synonym}"
+                    )
+
+                    print(
+                        "[HealthGuard OCR] Checking RxNorm:",
+                        {
+                            "rxcui": rxcui,
+                            "name": name,
+                            "synonym": synonym,
+                        },
+                    )
+
+                    # ----------------------------------------
+                    # Generic verification
+                    # ----------------------------------------
+
+                    normalized_requested_generic = (
+                        normalize_generic_text(
+                            generic
+                        )
+                    )
+
+                    normalized_name = (
+                        normalize_generic_text(
+                            name
+                        )
+                    )
+
+                    normalized_synonym = (
+                        normalize_generic_text(
+                            synonym
+                        )
+                    )
+
+                    generic_match = (
+                        normalized_requested_generic
+                        in normalized_name
+                        or normalized_requested_generic
+                        in normalized_synonym
+                    )
+
+                    if not generic_match:
+                        print(
+                            "[HealthGuard OCR] RxNorm candidate "
+                            "rejected: generic mismatch.",
+                            rxcui,
+                        )
+                        continue
+
+                    # ----------------------------------------
+                    # Exact strength verification
+                    # ----------------------------------------
+
+                    strength_pattern = (
+                        rf"\b"
+                        rf"{re.escape(strength_value)}"
+                        rf"\s*"
+                        rf"{re.escape(strength_unit)}"
+                        rf"\b"
+                    )
+
+                    strength_match = (
+                        re.search(
+                            strength_pattern,
+                            searchable_text,
+                            re.IGNORECASE,
+                        )
+                        is not None
+                    )
+
+                    if not strength_match:
+                        print(
+                            "[HealthGuard OCR] RxNorm candidate "
+                            "rejected: strength mismatch.",
+                            {
+                                "rxcui": rxcui,
+                                "requested": strength,
+                                "name": name,
+                            },
+                        )
+                        continue
+
+                    # ----------------------------------------
+                    # DOSAGE FORM SAFETY CHECK
+                    # ----------------------------------------
+
+                    requested_form = normalize_ocr_text(
+                        dosage_form or ""
+                    )
+
+                    candidate_text = normalize_ocr_text(
+                        f"{name} {synonym}"
+                    )
+
+                    candidate_form = ""
+
+                    rxnorm_forms = [
+                        ("suppository", "suppository"),
+                        ("suppositories", "suppository"),
+                        ("tablet", "tablet"),
+                        ("tablets", "tablet"),
+                        ("capsule", "capsule"),
+                        ("capsules", "capsule"),
+                        ("suspension", "suspension"),
+                        ("syrup", "syrup"),
+                        ("injection", "injection"),
+                        ("cream", "cream"),
+                        ("ointment", "ointment"),
+                    ]
+
+                    for keyword, form_name in rxnorm_forms:
+                        if re.search(
+                            rf"\b{re.escape(keyword)}\b",
+                            candidate_text,
+                        ):
+                            candidate_form = form_name
+                            break
+
+                    # A rectal product must never be accepted as
+                    # a tablet or as an unspecified oral product.
+                    is_rectal_candidate = (
+                        "rectal" in candidate_text
+                        or candidate_form == "suppository"
+                    )
+
+                    if is_rectal_candidate and requested_form != "suppository":
+                        print(
+                            "[HealthGuard OCR] RxNorm candidate "
+                            "rejected: rectal/suppository form conflict.",
+                            {
+                                "name": name,
+                                "synonym": synonym,
+                                "requested_form": requested_form,
+                            },
+                        )
+                        continue
+
+                    if (
+                        requested_form
+                        and candidate_form
+                        and requested_form != candidate_form
+                    ):
+                        print(
+                            "[HealthGuard OCR] RxNorm candidate "
+                            "rejected: dosage form mismatch.",
+                            {
+                                "name": name,
+                                "candidate_form": candidate_form,
+                                "requested_form": requested_form,
+                            },
+                        )
+                        continue
+
+                    # ----------------------------------------
+                    # SUCCESS
+                    # ----------------------------------------
+
+                    print(
+                        "[HealthGuard OCR] EXACT RxNorm "
+                        "generic-strength match found:",
+                        {
+                            "rxcui": rxcui,
+                            "name": name,
+                            "synonym": synonym,
+                            "requested": requested_identity,
+                        },
+                    )
+
+                    return {
+                        "rxcui": str(rxcui),
+                        "rxnorm_id": str(rxcui),
+                        "name": name,
+                        "synonym": synonym,
+                        "generic_name": generic,
+                        "active_ingredient": generic,
+                        "strength": strength,
+                        "matched_query": requested_identity,
+                        "match_score": 100,
+                        "sources": [
+                            {
+                                "source": "RxNorm",
+                                "rxcui": str(rxcui),
+                            }
+                        ],
+                        "source": [
+                            "RxNorm"
+                        ],
+                        "data_status": (
+                            "generic_strength_verified"
+                        ),
+                    }
+
+                except Exception as candidate_error:
+                    print(
+                        "[HealthGuard OCR] RxNorm candidate "
+                        "inspection failed:",
+                        candidate_error,
+                    )
+                    continue
+
+    except Exception as error:
+        print(
+            "[HealthGuard OCR] Direct RxNorm exact "
+            "generic-strength lookup failed:",
+            error,
+        )
+
+    print(
+        "[HealthGuard OCR] No exact generic-strength "
+        "medicine found:",
+        requested_identity,
+    )
+
+    return None
+
+
+# ============================================================
+# SEARCH WITH OCR IDENTITY
+# ============================================================
+
+async def find_medicine_from_identity(
+    identity: dict,
+    candidates: list,
+):
+    """
+    Safe OCR medicine lookup.
+
+    Search order:
+
+    1. Detected brand
+    2. Exact generic + strength
+    3. Generic only when strength was NOT detected
+
+    A different-strength medicine is never accepted.
+    """
+
+    brand = identity.get(
+        "brand_name",
+        "",
+    ).strip()
+
+    generic = identity.get(
+        "generic_name",
+        "",
+    ).strip()
+
+    strength = identity.get(
+        "strength",
+        "",
+    ).strip()
+
+    # ========================================================
+    # 1. BRAND SEARCH
+    # ========================================================
+
+    if brand:
+        print(
+            "[HealthGuard OCR] Brand search:",
+            brand,
+        )
+
+        try:
+            medicine_info = (
+                await get_real_medicine_information(
+                    brand
+                )
+            )
+
+            if medicine_info:
+                if profile_matches_identity(
+                    medicine_info,
+                    identity,
+                ):
+                    return {
+                        "matched_text": brand,
+                        "medicine_information": (
+                            medicine_info
+                        ),
+                        "match_type": (
+                            "verified_ocr_identity"
+                        ),
+                    }
+
+            print(
+                "[HealthGuard OCR] Brand was not "
+                "independently verified:",
+                brand,
+            )
+
+        except Exception as error:
+            print(
+                "[HealthGuard OCR] Brand lookup failed:",
+                error,
+            )
+
+    # ========================================================
+    # 2. EXACT GENERIC + STRENGTH
+    # ========================================================
+
+    if generic and strength:
+
+        medicine_info = (
+            await find_exact_generic_strength_information(
+                generic,
+                strength,
+                identity.get("dosage_form", ""),
+            )
+        )
+
+        if medicine_info:
+            return {
+                "matched_text": (
+                    f"{generic} {strength}"
+                ),
+                "medicine_information": (
+                    medicine_info
+                ),
+                "match_type": (
+                    "verified_generic_strength"
+                ),
+            }
+
+        print(
+            "[HealthGuard OCR] Exact generic + strength "
+            "could not be verified:",
+            f"{generic} {strength}",
+        )
+
+    # ========================================================
+    # 3. GENERIC FALLBACK
+    #
+    # ONLY when OCR did NOT detect strength.
+    # ========================================================
+
+    if generic and not strength:
+
+        try:
+            medicine_info = (
+                await get_real_medicine_information(
+                    generic
+                )
+            )
+
+            if medicine_info:
+
+                generic_identity = {
+                    "brand_name": "",
+                    "generic_name": generic,
+                    "strength": "",
+                    "dosage_form": identity.get(
+                        "dosage_form",
+                        "",
+                    ),
+                }
+
+                if profile_matches_identity(
+                    medicine_info,
+                    generic_identity,
+                ):
+                    return {
+                        "matched_text": generic,
+                        "medicine_information": (
+                            medicine_info
+                        ),
+                        "match_type": (
+                            "verified_generic"
+                        ),
+                    }
+
+        except Exception as error:
+            print(
+                "[HealthGuard OCR] Generic lookup failed:",
+                error,
+            )
+
+    return None
+
+
+# ============================================================
+# OCR ANALYZE ENDPOINT
+# ============================================================
+
+@router.post("/analyze")
+async def analyze_medicine_image(
+    file: UploadFile = File(...),
+):
+
+    # ========================================================
+    # FILE VALIDATION
+    # ========================================================
+
+    if not file.content_type:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type.",
+        )
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload an image file.",
+        )
+
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded image is empty.",
+        )
+
+    try:
+
+        # ====================================================
+        # STEP 1: OCR
+        # ====================================================
+
+        extracted_text = await asyncio.to_thread(
+            extract_text_from_image,
+            image_bytes,
+        )
+
+        if not extracted_text:
+
+            return {
+                "success": True,
+                "medicine_found": False,
+                "message": (
+                    "No readable text was "
+                    "found in the image."
+                ),
+                "filename": file.filename,
+                "extracted_text": "",
+                "candidates": [],
+                "ocr_identity": {
+                    "brand_name": "",
+                    "generic_name": "",
+                    "strength": "",
+                    "dosage_form": "",
+                },
+                "medicine": None,
+            }
+
+        # ====================================================
+        # STEP 2: STRUCTURED OCR IDENTITY
+        # ====================================================
+
+        identity = (
+            extract_medicine_identity(
+                extracted_text
+            )
+        )
+
+        # ====================================================
+        # STEP 3: OCR CANDIDATES
+        # ====================================================
+
+        candidates = (
+            extract_possible_medicine_names(
+                extracted_text
+            )
+        )
+
+        # ----------------------------------------------------
+        # Add detected identity values to candidates.
+        # ----------------------------------------------------
+
+        identity_candidates = []
+
+        if identity.get("brand_name"):
+            identity_candidates.append(
+                identity["brand_name"]
+            )
+
+        if identity.get("generic_name"):
+            identity_candidates.append(
+                identity["generic_name"]
+            )
+
+        existing_keys = {
+            normalize_ocr_text(item)
+            for item in candidates
+        }
+
+        for candidate in identity_candidates:
+
+            if not candidate:
+                continue
+
+            candidate_key = normalize_ocr_text(
+                candidate
+            )
+
+            if candidate_key not in existing_keys:
+                candidates.insert(
+                    0,
+                    candidate,
+                )
+
+                existing_keys.add(
+                    candidate_key
+                )
+
+        candidates = candidates[:20]
+
+        print(
+            "\n[HealthGuard OCR] Identity:",
+            identity,
+        )
+
+        print(
+            "[HealthGuard OCR] Candidates:",
+            candidates,
+        )
+
+        # ====================================================
+        # STEP 4: VERIFIED MEDICINE SEARCH
+        # ====================================================
+
+        matched_medicine = (
+            await find_medicine_from_identity(
+                identity,
+                candidates,
+            )
+        )
+
+        # ====================================================
+        # STEP 5: MATCH FOUND
+        # ====================================================
+
+        if matched_medicine:
+
+            medicine = (
+                matched_medicine[
+                    "medicine_information"
+                ]
+            )
+
+            match_type = (
+                matched_medicine.get(
+                    "match_type",
+                    "",
+                )
+            )
+
+            # ------------------------------------------------
+            # Determine brand verification.
+            # ------------------------------------------------
+
+            ocr_brand = normalize_ocr_text(
+                identity.get(
+                    "brand_name",
+                    "",
+                )
+            )
+
+            database_brand = normalize_ocr_text(
+                str(
+                    medicine.get(
+                        "brand_name",
+                        "",
+                    )
+                )
+            )
+
+            brand_verified = bool(
+                ocr_brand
+                and normalize_brand_identity(ocr_brand)
+                == normalize_brand_identity(database_brand)
+            )
+
+            # ------------------------------------------------
+            # Generic and strength detected.
+            # ------------------------------------------------
+
+            generic_verified = bool(
+                identity.get(
+                    "generic_name"
+                )
+            )
+
+            strength_verified = bool(
+                identity.get(
+                    "strength"
+                )
+            )
+
+            # =================================================
+            # CASE A: BRAND VERIFIED
+            # =================================================
+
+            if brand_verified:
+                medicine["ocr_brand_name"] = identity.get("brand_name", "")
+                medicine["ocr_generic_name"] = identity.get("generic_name", "")
+                medicine["ocr_strength"] = identity.get("strength", "")
+                medicine["ocr_dosage_form"] = identity.get("dosage_form", "")
+                medicine["ocr_match_type"] = "verified_brand"
+
+                return {
+                    "success": True,
+                    "medicine_found": True,
+                    "filename": file.filename,
+                    "extracted_text": extracted_text,
+                    "candidates": candidates,
+                    "ocr_identity": identity,
+                    "matched_text": matched_medicine["matched_text"],
+                    "match_type": "verified_brand",
+                    "verification_message": "Brand name matched the database result.",
+                    "medicine": medicine,
+                }
+
+            # Do not trust a result just because the search returned it.
+            # Continue to generic-strength verification only when those
+            # fields have actually been checked against the medicine.
+
+            # =================================================
+            # CASE B:
+            # GENERIC + STRENGTH VERIFIED
+            # BRAND NOT VERIFIED
+            # =================================================
+            if (
+                generic_verified
+                and strength_verified
+                and profile_matches_identity(
+                    medicine,
+                    {
+                        **identity,
+                        "brand_name": "",
+                    },
+                )
+            ):
+                safe_medicine = (
+                    await build_generic_strength_verified_result(
+                        medicine,
+                        identity,
+                    )
+                )
+
+                return {
+                    "success": True,
+                    "medicine_found": True,
+                    "filename": file.filename,
+                    "extracted_text": extracted_text,
+                    "candidates": candidates,
+                    "ocr_identity": identity,
+                    "matched_text": (
+                        matched_medicine[
+                            "matched_text"
+                        ]
+                    ),
+                    "match_type": (
+                        "verified_generic_strength_brand_unverified"
+                    ),
+                    "verification_message": (
+                        "Generic medicine and strength "
+                        "were verified from the package. "
+                        "The brand name was not independently "
+                        "verified, so brand-specific information "
+                        "has not been returned."
+                    ),
+                    "medicine": safe_medicine,
+                }
+
+            # =================================================
+            # CASE C: UNVERIFIED
+            # =================================================
+
+            return {
+                "success": True,
+                "medicine_found": False,
+                "filename": file.filename,
+                "extracted_text": extracted_text,
+                "candidates": candidates,
+                "ocr_identity": identity,
+                "matched_text": None,
+                "match_type": "unverified",
+                "medicine": None,
+                "message": (
+                    "Medicine text was detected, "
+                    "but the medicine identity could "
+                    "not be safely verified."
+                ),
+            }
+
+        # ====================================================
+        # STEP 6: NO VERIFIED MATCH
+        # ====================================================
+
+        return {
+            "success": True,
+            "medicine_found": False,
+            "filename": file.filename,
+            "extracted_text": extracted_text,
+            "candidates": candidates,
+            "ocr_identity": identity,
+            "matched_text": None,
+            "match_type": "unverified",
+            "medicine": None,
+            "message": (
+                "Medicine text was detected, "
+                "but the medicine identity could "
+                "not be verified from the available "
+                "database information. No unrelated "
+                "medicine information was returned."
+            ),
+        }
+
+    except Exception as error:
+
+        print(
+            "OCR medicine analysis failed:",
+            error,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to analyze "
+                "the medicine image."
+            ),
+        )
+

@@ -1,0 +1,133 @@
+﻿import io
+import re
+
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import pytesseract
+
+
+def _prepare_image(image: Image.Image) -> list:
+    """
+    Create several OCR-friendly versions of the uploaded image.
+    The original image is always retained as an OCR candidate.
+    """
+
+    image = ImageOps.exif_transpose(image)
+    image = ImageOps.grayscale(image)
+
+    variants = [image]
+
+    # Improve contrast.
+    contrast = ImageEnhance.Contrast(image).enhance(1.8)
+    variants.append(contrast)
+
+    # Improve sharpness.
+    sharp = ImageEnhance.Sharpness(contrast).enhance(2.0)
+    variants.append(sharp)
+
+    # Threshold version for uneven backgrounds.
+    threshold = sharp.point(
+        lambda pixel: 255 if pixel > 155 else 0
+    )
+    variants.append(threshold)
+
+    # Upscale small package images.
+    width, height = image.size
+    if max(width, height) < 1800:
+        scale = min(2.0, 1800 / max(width, height))
+        new_size = (
+            max(1, int(width * scale)),
+            max(1, int(height * scale)),
+        )
+        enlarged = sharp.resize(new_size, Image.Resampling.LANCZOS)
+        variants.append(enlarged)
+
+    return variants
+
+
+def extract_text_from_image(image_bytes: bytes) -> str:
+    """
+    Best-effort OCR for medicine/package images.
+
+    Attempts multiple image enhancements and Tesseract modes.
+    Returns extracted text without guessing missing medicine details.
+    """
+
+    if not image_bytes:
+        return ""
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as uploaded:
+            uploaded.load()
+            image = ImageOps.exif_transpose(uploaded).convert("RGB")
+
+        variants = _prepare_image(image)
+
+    except Exception as error:
+        print("[HealthGuard OCR] Image opening/preparation failed:", error)
+        return ""
+
+    configurations = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 11",
+        "--oem 3 --psm 12",
+    ]
+
+    results = []
+    seen = set()
+
+    for index, variant in enumerate(variants):
+        for config in configurations:
+            try:
+                text = pytesseract.image_to_string(
+                    variant,
+                    config=config,
+                ).strip()
+
+                normalized = re.sub(r"\s+", " ", text).strip().lower()
+
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    results.append(text)
+
+                print(
+                    "[HealthGuard OCR] Pass:",
+                    index + 1,
+                    "Config:",
+                    config,
+                    "Characters:",
+                    len(text),
+                )
+
+            except Exception as error:
+                print("[HealthGuard OCR] OCR pass failed:", error)
+
+    if not results:
+        return ""
+
+    # Prefer the result with the most useful readable text.
+    results.sort(
+        key=lambda value: (
+            sum(character.isalnum() for character in value),
+            len(value),
+        ),
+        reverse=True,
+    )
+
+    best = results[0]
+
+    # Include additional non-duplicate text from other passes.
+    combined = [best]
+    best_words = set(re.findall(r"[a-z0-9]+", best.lower()))
+
+    for candidate in results[1:]:
+        candidate_words = set(
+            re.findall(r"[a-z0-9]+", candidate.lower())
+        )
+
+        new_words = candidate_words - best_words
+
+        if len(new_words) >= 3:
+            combined.append(candidate)
+            best_words.update(candidate_words)
+
+    return "\n\n".join(combined).strip()

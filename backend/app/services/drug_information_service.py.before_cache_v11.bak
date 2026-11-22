@@ -1,0 +1,1753 @@
+import asyncio
+import re
+from datetime import datetime, timezone
+
+import httpx
+
+from app.database import database
+from app.services.indian_medicine_service import (
+    search_indian_medicines,
+    build_indian_medicine_profile,
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+RXNORM_BASE_URL = "https://rxnav.nlm.nih.gov/REST"
+OPENFDA_BASE_URL = "https://api.fda.gov/drug/label.json"
+
+CACHE_COLLECTION = database["medicine_information_cache"]
+
+HTTP_TIMEOUT = 10.0
+
+# Increase this whenever the medicine-information pipeline changes.
+CACHE_VERSION = 10
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def normalize_text(value):
+    if value is None:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value),
+    ).strip()
+
+
+def normalize_key(value):
+    value = normalize_text(value).lower()
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value,
+    )
+
+    return re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
+
+
+def unique_list(values):
+    result = []
+
+    for value in values:
+        value = normalize_text(value)
+
+        if value and value not in result:
+            result.append(value)
+
+    return result
+
+
+def first_value(*values):
+    for value in values:
+        value = normalize_text(value)
+
+        if value:
+            return value
+
+    return ""
+
+
+def merge_information_text(*values, max_chars=1800):
+    """
+    Merge source-provided text without inventing or replacing information.
+    Supports strings and lists, removes duplicate sentences/items, and
+    returns newline-separated entries for the frontend.
+    """
+    parts = []
+    seen = set()
+
+    for value in values:
+        if value is None:
+            continue
+
+        candidates = value if isinstance(value, (list, tuple, set)) else [value]
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate = first_value(
+                    candidate.get("text"),
+                    candidate.get("description"),
+                    candidate.get("name"),
+                )
+
+            text = normalize_text(candidate)
+            if not text:
+                continue
+
+            # Split only on sentence endings, semicolons, and bullet markers.
+            segments = re.split(
+                r"(?<=[.!?])\s+|;\s*|[•â€¢]\s*",
+                text,
+            )
+
+            for segment in segments:
+                segment = normalize_text(segment)
+                if not segment:
+                    continue
+
+                key = normalize_key(segment)
+                if key and key not in seen:
+                    seen.add(key)
+                    parts.append(segment)
+
+    result = "\n".join(parts).strip()
+
+    if len(result) > max_chars:
+        result = result[:max_chars].rsplit(" ", 1)[0].rstrip() + "..."
+
+    return result
+
+# ============================================================
+# FDA TEXT CLEANING
+# ============================================================
+
+def remove_fda_section_heading(value):
+    """
+    Remove FDA headings such as:
+    1 INDICATIONS AND USAGE
+    2 DOSAGE AND ADMINISTRATION
+    4 CONTRAINDICATIONS
+    5 WARNINGS AND PRECAUTIONS
+    6 ADVERSE REACTIONS
+    7 DRUG INTERACTIONS
+    """
+
+    value = normalize_text(value)
+
+    if not value:
+        return ""
+
+    heading_pattern = (
+        r"^\s*\d+(?:\.\d+)?\s+"
+        r"(?:"
+        r"INDICATIONS?\s+AND\s+USAGE|"
+        r"DOSAGE\s+AND\s+ADMINISTRATION|"
+        r"CONTRAINDICATIONS?|"
+        r"WARNINGS?\s+AND\s+PRECAUTIONS?|"
+        r"ADVERSE\s+REACTIONS?|"
+        r"DRUG\s+INTERACTIONS?"
+        r")"
+        r"\s*[:\-]?\s*"
+    )
+
+    value = re.sub(
+        heading_pattern,
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    return normalize_text(value)
+
+
+def clean_fda_text(
+    value,
+    max_sentences=4,
+    max_chars=1600,
+):
+    """
+    Convert long FDA text into short readable text.
+    """
+
+    value = normalize_text(value)
+
+    if not value:
+        return ""
+
+    value = re.sub(
+        r"\[[^\]]+\]",
+        "",
+        value,
+    )
+
+    value = remove_fda_section_heading(value)
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
+
+    if not value:
+        return ""
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        value,
+    )
+
+    selected = []
+
+    for sentence in sentences:
+        sentence = normalize_text(sentence)
+
+        if not sentence or len(sentence) < 25:
+            continue
+
+        if "â€¢" in sentence:
+            sentence = sentence.split("â€¢", 1)[0].strip()
+
+        if sentence and sentence not in selected:
+            selected.append(sentence)
+
+        if len(selected) >= max_sentences:
+            break
+
+    result = " ".join(selected).strip()
+
+    if not result:
+        result = value
+
+    if len(result) > max_chars:
+        result = (
+            result[:max_chars]
+            .rsplit(" ", 1)[0]
+            .strip()
+        )
+        result += "..."
+
+    return result
+
+
+# ============================================================
+# SIDE EFFECT CLEANING
+# ============================================================
+
+def clean_short_list(
+    value,
+    max_items=4,
+    max_chars=700,
+):
+    """
+    Keep side-effect information short and readable.
+    """
+
+    value = normalize_text(value)
+
+    if not value:
+        return ""
+
+    value = re.sub(
+        r"\[[^\]]+\]",
+        "",
+        value,
+    )
+
+    value = remove_fda_section_heading(value)
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value,
+    ).strip()
+
+    if not value:
+        return ""
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        value,
+    )
+
+    selected = []
+
+    for sentence in sentences:
+        sentence = normalize_text(sentence)
+
+        if not sentence or len(sentence) < 20:
+            continue
+
+        if "â€¢" in sentence:
+            for part in sentence.split("â€¢"):
+                part = normalize_text(part)
+
+                if (
+                    part
+                    and len(part) >= 20
+                    and part not in selected
+                ):
+                    selected.append(part)
+
+                if len(selected) >= max_items:
+                    break
+        else:
+            if sentence not in selected:
+                selected.append(sentence)
+
+        if len(selected) >= max_items:
+            break
+
+    result = ". ".join(selected).strip()
+
+    if result and not result.endswith((".", "!", "?")):
+        result += "."
+
+    if len(result) > max_chars:
+        result = (
+            result[:max_chars]
+            .rsplit(" ", 1)[0]
+            .strip()
+        )
+        result += "..."
+
+    return result
+
+
+# ============================================================
+# INGREDIENT EXTRACTION
+# ============================================================
+
+def extract_active_ingredient(generic_name):
+    """
+    Paracetamol (650mg) -> Paracetamol
+    Azithromycin (500mg) -> Azithromycin
+    """
+
+    value = normalize_text(generic_name)
+
+    if not value:
+        return ""
+
+    value = re.sub(r"\([^)]*\)", "", value)
+    value = re.sub(r"\[[^\]]*\]", "", value)
+
+    # Use the first ingredient when multiple are listed.
+    value = value.split(",")[0]
+
+    return normalize_text(value)
+
+
+def normalize_ingredient_for_api(ingredient):
+    """
+    Convert common Indian medicine names to names understood by
+    RxNorm/openFDA.
+    """
+
+    value = normalize_text(ingredient)
+
+    aliases = {
+        "paracetamol": "acetaminophen",
+        "acetaminophen": "acetaminophen",
+        "ibuprofen": "ibuprofen",
+        "azithromycin": "azithromycin",
+        "amoxicillin": "amoxicillin",
+        "cetirizine": "cetirizine",
+        "levocetirizine": "levocetirizine",
+        "pantoprazole": "pantoprazole",
+        "omeprazole": "omeprazole",
+        "metformin": "metformin",
+        "atorvastatin": "atorvastatin",
+        "amlodipine": "amlodipine",
+    }
+
+    return aliases.get(
+        normalize_key(value),
+        value,
+    )
+
+
+# ============================================================
+# MONGODB CACHE
+# ============================================================
+
+async def get_cached_medicine(medicine_name):
+    key = normalize_key(medicine_name)
+
+    if not key:
+        return None
+
+    try:
+        cached = await CACHE_COLLECTION.find_one(
+            {
+                "cache_key": key,
+                "cache_version": CACHE_VERSION,
+            }
+        )
+
+        if cached:
+            cached.pop("_id", None)
+
+            print(
+                f"[HealthGuard] MongoDB cache HIT: {medicine_name}"
+            )
+
+            return cached.get("medicine")
+
+    except Exception as error:
+        print(
+            "[HealthGuard] MongoDB cache read failed:",
+            error,
+        )
+
+    return None
+
+
+async def save_medicine_cache(medicine_name, medicine):
+    key = normalize_key(medicine_name)
+
+    if not key or not medicine:
+        return
+
+    try:
+        await CACHE_COLLECTION.update_one(
+            {"cache_key": key},
+            {
+                "$set": {
+                    "cache_key": key,
+                    "cache_version": CACHE_VERSION,
+                    "medicine_name": medicine_name,
+                    "medicine": medicine,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+
+        print(
+            f"[HealthGuard] MongoDB cache SAVED: {medicine_name}"
+        )
+
+    except Exception as error:
+        print(
+            "[HealthGuard] MongoDB cache save failed:",
+            error,
+        )
+
+
+# ============================================================
+# RXNORM
+# ============================================================
+
+async def search_rxnorm(ingredient):
+    ingredient = normalize_text(ingredient)
+
+    if not ingredient:
+        return {}
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            response = await client.get(
+                f"{RXNORM_BASE_URL}/rxcui.json",
+                params={"name": ingredient},
+            )
+
+        if response.status_code != 200:
+            print(
+                "[HealthGuard] RxNorm request returned:",
+                response.status_code,
+            )
+            return {}
+
+        data = response.json()
+        id_group = data.get("idGroup", {})
+        rxcui_list = id_group.get("rxnormId", [])
+
+        if not rxcui_list:
+            print(
+                f"[HealthGuard] No RxNorm ID found for {ingredient}"
+            )
+            return {}
+
+        rxcui = str(rxcui_list[0])
+
+        print("[HealthGuard] RxNorm ID:", rxcui)
+
+        return {
+            "rxcui": rxcui,
+            "source": "RxNorm",
+        }
+
+    except Exception as error:
+        print(
+            "[HealthGuard] RxNorm lookup failed:",
+            error,
+        )
+        return {}
+
+
+# ============================================================
+# OPENFDA HELPERS
+# ============================================================
+
+def get_openfda_value(record, field):
+    value = record.get(field)
+
+    if isinstance(value, list):
+        return normalize_text(
+            " ".join(str(item) for item in value)
+        )
+
+    return normalize_text(value)
+
+
+# ============================================================
+# DRUG INTERACTION EXTRACTION
+# ============================================================
+
+def extract_interactions_from_text(text):
+    """
+    Extract potentially useful interaction statements from label text.
+    This is informational text extraction, not a clinical interaction check.
+    """
+
+    text = normalize_text(text)
+
+    if not text:
+        return ""
+
+    patterns = [
+        r"[^.!?]*\bwarfarin\b[^.!?]*[.!?]",
+        r"[^.!?]*\bblood thinning\b[^.!?]*[.!?]",
+        r"[^.!?]*\banticoagulant\b[^.!?]*[.!?]",
+        r"[^.!?]*\bdrug interaction\b[^.!?]*[.!?]",
+        r"[^.!?]*\bdrug interactions\b[^.!?]*[.!?]",
+        r"[^.!?]*\binteractions?\b[^.!?]*[.!?]",
+        r"[^.!?]*\btaking\b[^.!?]*\bpharmacist\b[^.!?]*[.!?]",
+        r"[^.!?]*\btaking\b[^.!?]*\bdoctor\b[^.!?]*[.!?]",
+    ]
+
+    matches = []
+
+    for pattern in patterns:
+        found = re.findall(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        for item in found:
+            item = normalize_text(item)
+
+            if item and item not in matches:
+                matches.append(item)
+
+    return " ".join(matches[:3])
+
+
+# ============================================================
+# OPENFDA SINGLE INGREDIENT CHECK
+# ============================================================
+
+def is_single_ingredient_record(record, requested_ingredient):
+    if not record:
+        return False, 0
+
+    requested = normalize_key(requested_ingredient)
+
+    openfda = record.get("openfda", {}) or {}
+
+    active_ingredient = get_openfda_value(
+        record,
+        "active_ingredient",
+    )
+
+    generic_name = get_openfda_value(
+        openfda,
+        "generic_name",
+    )
+
+    substance_name = get_openfda_value(
+        openfda,
+        "substance_name",
+    )
+
+    combined_raw = " ".join(
+        [
+            active_ingredient,
+            generic_name,
+            substance_name,
+        ]
+    ).lower()
+
+    # Reject combination medicines.
+    combination_patterns = [
+        r"\band\b",
+        r"\bwith\b",
+        r"\bplus\b",
+        r"/",
+        r"\+",
+        r",\s*[a-z]",
+    ]
+
+    for pattern in combination_patterns:
+        if re.search(pattern, combined_raw, flags=re.IGNORECASE):
+            return False, 0
+
+    cleaned_active = normalize_key(
+        re.sub(
+            r"\b\d+(?:\.\d+)?\s*(mg|mcg|g|ml|%|iu)\b",
+            "",
+            active_ingredient,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    cleaned_generic = normalize_key(
+        re.sub(
+            r"\b\d+(?:\.\d+)?\s*(mg|mcg|g|ml|%|iu)\b",
+            "",
+            generic_name,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    cleaned_substance = normalize_key(substance_name)
+
+    score = 0
+
+    if cleaned_active == requested:
+        score += 100
+
+    if cleaned_generic == requested:
+        score += 90
+
+    if cleaned_substance == requested:
+        score += 80
+
+    if requested in cleaned_active:
+        score += 50
+
+    if requested in cleaned_generic:
+        score += 40
+
+    if requested in cleaned_substance:
+        score += 30
+
+    if score < 40:
+        return False, 0
+
+    return True, score
+
+
+# ============================================================
+# BUILD OPENFDA PROFILE
+# ============================================================
+
+def build_openfda_profile(record):
+    if not record:
+        return {}
+
+    openfda = record.get("openfda", {}) or {}
+
+    brand_name = get_openfda_value(openfda, "brand_name")
+    generic_name = get_openfda_value(openfda, "generic_name")
+    manufacturer = get_openfda_value(openfda, "manufacturer_name")
+
+    dosage_form = get_openfda_value(record, "dosage_form")
+    route = get_openfda_value(record, "route")
+
+    purpose = get_openfda_value(record, "purpose")
+    indications = get_openfda_value(record, "indications_and_usage")
+    description = get_openfda_value(record, "description")
+
+    warnings = get_openfda_value(record, "warnings")
+    contraindications = get_openfda_value(record, "contraindications")
+    adverse_reactions = get_openfda_value(record, "adverse_reactions")
+    dedicated_interactions = get_openfda_value(record, "drug_interactions")
+
+    # Only the dedicated FDA drug_interactions field is presented as
+    # interaction information. General warnings/patient advice are not
+    # confirmed drug-interaction statements.
+    drug_interactions = dedicated_interactions
+
+    dosage_and_administration = get_openfda_value(
+        record,
+        "dosage_and_administration",
+    )
+
+    pregnancy = get_openfda_value(record, "pregnancy")
+    storage = get_openfda_value(record, "storage_and_handling")
+
+    clean_purpose = clean_fda_text(
+        purpose,
+        max_sentences=2,
+        max_chars=650,
+    )
+
+    clean_indications = clean_fda_text(
+        indications,
+        max_sentences=1,
+        max_chars=450,
+    )
+
+    clean_description = clean_fda_text(
+        description,
+        max_sentences=2,
+        max_chars=700,
+    )
+
+    clean_warnings = clean_fda_text(
+        warnings,
+        max_sentences=4,
+        max_chars=1200,
+    )
+
+    clean_contraindications = clean_fda_text(
+        contraindications,
+        max_sentences=3,
+        max_chars=800,
+    )
+
+    clean_adverse_reactions = clean_short_list(
+        adverse_reactions,
+        max_items=4,
+        max_chars=700,
+    )
+
+    clean_drug_interactions = clean_fda_text(
+        drug_interactions,
+        max_sentences=3,
+        max_chars=900,
+    )
+
+    return {
+        "fda_brand_name": brand_name,
+        "fda_generic_name": generic_name,
+        "fda_manufacturer": manufacturer,
+        "dosage_form": dosage_form,
+        "route": route,
+        "purpose": clean_purpose,
+        "indications": clean_indications,
+        "description": clean_description,
+        "warnings": clean_warnings,
+        "contraindications": clean_contraindications,
+        "adverse_reactions": clean_adverse_reactions,
+        "drug_interactions": clean_drug_interactions,
+        "dosage_and_administration": clean_fda_text(
+            dosage_and_administration,
+            max_sentences=2,
+            max_chars=700,
+        ),
+        "pregnancy": clean_fda_text(
+            pregnancy,
+            max_sentences=2,
+            max_chars=700,
+        ),
+        "storage": clean_fda_text(
+            storage,
+            max_sentences=2,
+            max_chars=500,
+        ),
+        "source": "openFDA",
+    }
+
+
+# ============================================================
+# OPENFDA SEARCH
+# ============================================================
+
+async def search_openfda(ingredient):
+    """
+    Search for one high-confidence FDA label.
+    We intentionally do not merge multiple FDA labels.
+    """
+
+    ingredient = normalize_text(ingredient)
+
+    if not ingredient:
+        return {}
+
+    escaped = ingredient.replace('"', '\\"')
+
+    queries = [
+        f'active_ingredient:"{escaped}"',
+        f'openfda.substance_name:"{escaped}"',
+        f'openfda.generic_name:"{escaped}"',
+    ]
+
+    candidates = []
+
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            for query in queries:
+                try:
+                    response = await client.get(
+                        OPENFDA_BASE_URL,
+                        params={
+                            "search": query,
+                            "limit": "5",
+                        },
+                    )
+
+                    if response.status_code != 200:
+                        continue
+
+                    data = response.json()
+
+                    for record in data.get("results", []):
+                        relevant, score = is_single_ingredient_record(
+                            record,
+                            ingredient,
+                        )
+
+                        if relevant:
+                            candidates.append((score, record))
+
+                except Exception as error:
+                    print(
+                        "[HealthGuard] openFDA query failed:",
+                        query,
+                        error,
+                    )
+
+        if not candidates:
+            print(
+                f"[HealthGuard] No relevant openFDA label found for {ingredient}"
+            )
+            return {}
+
+        candidates.sort(
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        best_score, best_record = candidates[0]
+
+        print(
+            "[HealthGuard] Selected openFDA match score:",
+            best_score,
+        )
+
+        profile = build_openfda_profile(best_record)
+
+        if not profile:
+            return {}
+
+        print(
+            "[HealthGuard] openFDA selected ONE relevant label."
+        )
+
+        print(
+            "[HealthGuard] openFDA purpose available:",
+            bool(profile.get("purpose")),
+        )
+
+        print(
+            "[HealthGuard] openFDA indications available:",
+            bool(profile.get("indications")),
+        )
+
+        print(
+            "[HealthGuard] openFDA warnings available:",
+            bool(profile.get("warnings")),
+        )
+
+        print(
+            "[HealthGuard] openFDA side effects available:",
+            bool(profile.get("adverse_reactions")),
+        )
+
+        print(
+            "[HealthGuard] openFDA interactions available:",
+            bool(profile.get("drug_interactions")),
+        )
+
+        return profile
+
+    except Exception as error:
+        print(
+            "[HealthGuard] openFDA lookup failed:",
+            error,
+        )
+        return {}
+
+
+# ============================================================
+# MERGE MEDICINE INFORMATION
+# ============================================================
+
+def merge_medicine_information(
+    indian_profile,
+    rxnorm_profile,
+    fda_profile,
+):
+    indian_profile = indian_profile or {}
+    rxnorm_profile = rxnorm_profile or {}
+    fda_profile = fda_profile or {}
+
+    # ========================================================
+    # IDENTITY
+    # ========================================================
+
+    brand_name = first_value(
+        indian_profile.get("brand_name"),
+        fda_profile.get("fda_brand_name"),
+    )
+
+    generic_name = first_value(
+        indian_profile.get("generic_name"),
+        fda_profile.get("fda_generic_name"),
+    )
+
+    manufacturer = first_value(
+        indian_profile.get("manufacturer"),
+        fda_profile.get("fda_manufacturer"),
+    )
+
+    # ========================================================
+    # MEDICINE INFORMATION
+    # ========================================================
+
+    medicine_description = first_value(
+        indian_profile.get("medicine_description"),
+        fda_profile.get("purpose"),
+        fda_profile.get("description"),
+        fda_profile.get("indications"),
+    )
+
+    purpose = first_value(
+        fda_profile.get("purpose"),
+        fda_profile.get("description"),
+        fda_profile.get("indications"),
+    )
+
+    indications = first_value(
+        fda_profile.get("indications"),
+        fda_profile.get("purpose"),
+    )
+
+    # ========================================================
+    # CLINICAL INFORMATION
+    # ========================================================
+
+    warnings = merge_information_text(
+        fda_profile.get("warnings"),
+        indian_profile.get("warnings"),
+        max_chars=1800,
+    )
+
+    contraindications = merge_information_text(
+        fda_profile.get("contraindications"),
+        indian_profile.get("contraindications"),
+        max_chars=1200,
+    )
+
+    adverse_reactions = merge_information_text(
+        indian_profile.get("side_effects"),
+        fda_profile.get("adverse_reactions"),
+        max_chars=1200,
+    )
+
+    # Do not derive interactions from general warnings or precautions.
+    # Only source fields explicitly labelled as drug interactions qualify.
+    drug_interactions = merge_information_text(
+        indian_profile.get("drug_interactions"),
+        fda_profile.get("drug_interactions"),
+        max_chars=1200,
+    )
+
+    # ========================================================
+    # ADMINISTRATION
+    # ========================================================
+
+    route = first_value(fda_profile.get("route"))
+
+    dosage_form = first_value(
+        fda_profile.get("dosage_form"),
+        indian_profile.get("medicine_type"),
+    )
+
+    # ========================================================
+    # SOURCE ATTRIBUTION
+    # ========================================================
+
+    sources = []
+
+    if indian_profile:
+        sources.append("Indian Medicine Dataset")
+
+    if rxnorm_profile:
+        sources.append("RxNorm")
+
+    if fda_profile:
+        sources.append("openFDA")
+
+    sources = unique_list(sources)
+
+    def section_sources(*checks):
+        result = []
+        for condition, source_name in checks:
+            if condition:
+                result.append(source_name)
+        return unique_list(result)
+
+    information_sources = {
+        "medicine_identity": section_sources(
+            (
+                any(indian_profile.get(key) for key in (
+                    "brand_name", "generic_name", "manufacturer",
+                    "composition_2", "medicine_type"
+                )),
+                "Indian Medicine Dataset",
+            ),
+            (bool(rxnorm_profile.get("rxcui")), "RxNorm"),
+            (
+                bool(fda_profile.get("fda_generic_name")),
+                "openFDA",
+            ),
+        ),
+        "medicine_information": section_sources(
+            (bool(indian_profile.get("medicine_description")), "Indian Medicine Dataset"),
+            (
+                any(fda_profile.get(key) for key in ("purpose", "description", "indications")),
+                "openFDA",
+            ),
+        ),
+        "side_effects": section_sources(
+            (bool(indian_profile.get("side_effects")), "Indian Medicine Dataset"),
+            (bool(fda_profile.get("adverse_reactions")), "openFDA"),
+        ),
+        "warnings": section_sources(
+            (bool(indian_profile.get("warnings")), "Indian Medicine Dataset"),
+            (bool(fda_profile.get("warnings")), "openFDA"),
+        ),
+        "contraindications": section_sources(
+            (bool(indian_profile.get("contraindications")), "Indian Medicine Dataset"),
+            (bool(fda_profile.get("contraindications")), "openFDA"),
+        ),
+        "drug_interactions": section_sources(
+            (bool(indian_profile.get("drug_interactions")), "Indian Medicine Dataset"),
+            (bool(fda_profile.get("drug_interactions")), "openFDA"),
+        ),
+        "administration": section_sources(
+            (bool(indian_profile.get("medicine_type")), "Indian Medicine Dataset"),
+            (
+                any(fda_profile.get(key) for key in ("dosage_form", "route", "dosage_and_administration")),
+                "openFDA",
+            ),
+        ),
+    }
+
+    # ========================================================
+    # FINAL OBJECT
+    # ========================================================
+
+    strength_value, strength_unit = get_profile_strength(indian_profile)
+    strength = f"{strength_value} {strength_unit}".strip()
+
+    return {
+        "brand_name": brand_name,
+        "generic_name": generic_name,
+        "strength": strength,
+        "manufacturer": manufacturer,
+        "composition_2": indian_profile.get("composition_2", ""),
+        "medicine_type": indian_profile.get("medicine_type", ""),
+        "pack_size": indian_profile.get("pack_size", ""),
+        "price": indian_profile.get("price", ""),
+        "is_discontinued": indian_profile.get("is_discontinued", False),
+        "medicine_description": medicine_description,
+        "description": medicine_description,
+        "purpose": purpose,
+        "indications": indications,
+        "side_effects": adverse_reactions,
+        "adverse_reactions": adverse_reactions,
+        "warnings": warnings,
+        "contraindications": contraindications,
+        "drug_interactions": drug_interactions,
+        "dosage_form": dosage_form,
+        "route": route,
+        "dosage_and_administration": fda_profile.get(
+            "dosage_and_administration",
+            "",
+        ),
+        "pregnancy": fda_profile.get("pregnancy", ""),
+        "storage": fda_profile.get("storage", ""),
+        "rxcui": rxnorm_profile.get("rxcui", ""),
+        "rxnorm_id": rxnorm_profile.get("rxcui", ""),
+        "sources": sources,
+        "source": sources,
+        "information_sources": information_sources,
+        "data_status": (
+            "enriched" if len(sources) > 1
+            else "indian_dataset_only" if indian_profile
+            else "single_source" if sources
+            else "no_data"
+        ),
+    }
+
+# ============================================================
+# MAIN MEDICINE INFORMATION PIPELINE
+# ============================================================
+
+# ============================================================
+# BRAND-SAFE MATCHING
+# ============================================================
+
+def looks_like_brand_specific_query(medicine_name):
+    """
+    Detect likely brand-specific medicine queries.
+    Generic ingredient + strength queries should not be classified
+    as brand-specific when the ingredient is known.
+    """
+
+    value = normalize_key(medicine_name)
+
+    if not value:
+        return False
+
+    generic_ingredients = {
+        "paracetamol",
+        "acetaminophen",
+        "azithromycin",
+        "ibuprofen",
+        "amoxicillin",
+        "cetirizine",
+        "levocetirizine",
+        "pantoprazole",
+        "omeprazole",
+        "metformin",
+        "atorvastatin",
+        "amlodipine",
+    }
+
+    generic_query = re.sub(
+        r"\s+\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml)?$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if generic_query in generic_ingredients:
+        return False
+
+    if re.search(
+        r"\b[a-z]{2,}\s+\d{2,5}\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def split_name_and_strength(value):
+    """
+    Split medicine query/profile into normalized name and optional
+    strength, e.g. ("azithral", "500", "").
+    """
+
+    raw = normalize_key(value)
+
+    match = re.match(
+        r"^(.*?)\s+(\d+(?:\.\d+)?)\s*(mg|mcg|g|ml|iu|%)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return normalize_key(raw), "", ""
+
+    return (
+        normalize_key(match.group(1)),
+        match.group(2),
+        (match.group(3) or "").lower(),
+    )
+
+
+def get_profile_strength(profile):
+    """
+    Return strength only when explicitly present in generic name or
+    composition. Do not infer strength from pack size.
+    """
+
+    profile = profile or {}
+
+    source_text = " ".join(
+        [
+            normalize_text(profile.get("generic_name", "")),
+            normalize_text(profile.get("composition_2", "")),
+        ]
+    )
+
+    match = re.search(
+        r"(?<![A-Za-z0-9])(\d+(?:\.\d+)?)\s*(mcg|mg|g|ml|iu|%)",
+        source_text,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1), match.group(2).lower()
+
+    match = re.search(
+        r"\b(\d+(?:\.\d+)?)\b",
+        normalize_text(profile.get("generic_name", "")),
+    )
+
+    if match:
+        return match.group(1), ""
+
+    return "", ""
+
+
+def normalized_generic_identity(profile):
+    """
+    Normalize a single active ingredient. Reject combination ingredients
+    rather than accidentally matching them to one ingredient.
+    """
+
+    profile = profile or {}
+
+    raw = first_value(
+        profile.get("generic_name", ""),
+        profile.get("composition_2", ""),
+    ).lower()
+
+    if not raw:
+        return ""
+
+    if re.search(
+        r"\s(?:and|with|plus)\s|[+/]",
+        raw,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+
+    raw = re.sub(
+        r"\d+(?:\.\d+)?\s*(?:mcg|mg|g|ml|iu|%)?",
+        " ",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    raw = re.sub(
+        r"\b(?:tablet|tablets|tab|tabs|capsule|capsules|cap|caps|"
+        r"syrup|suspension|injection|oral|solution)\b",
+        " ",
+        raw,
+        flags=re.IGNORECASE,
+    )
+
+    return normalize_key(raw)
+
+
+def medicine_brand_matches_query(medicine_profile, medicine_name):
+    """
+    Strict brand validation: require matching brand name and, when
+    present in the query, matching strength.
+    """
+
+    if not medicine_profile:
+        return False
+
+    query = normalize_key(medicine_name)
+    database_brand = normalize_key(
+        medicine_profile.get("brand_name", "")
+    )
+
+    if not query or not database_brand:
+        return False
+
+    if query == database_brand:
+        return True
+
+    query_base, query_strength, query_unit = split_name_and_strength(query)
+    brand_base, brand_strength, brand_unit = split_name_and_strength(
+        database_brand
+    )
+
+    if not query_strength or query_base != brand_base:
+        return False
+
+    if brand_strength:
+        return (
+            query_strength == brand_strength
+            and (
+                not query_unit
+                or not brand_unit
+                or query_unit == brand_unit
+            )
+        )
+
+    profile_strength, profile_unit = get_profile_strength(
+        medicine_profile
+    )
+
+    return (
+        bool(profile_strength)
+        and query_strength == profile_strength
+        and (
+            not query_unit
+            or not profile_unit
+            or query_unit == profile_unit
+        )
+    )
+
+
+def profile_matches_generic_strength(
+    profile,
+    ingredient,
+    requested_strength,
+    requested_unit="",
+):
+    """
+    Validate generic fallback by ingredient AND explicit strength.
+    """
+
+    if not profile or not ingredient or not requested_strength:
+        return False
+
+    expected_ingredient = normalize_key(ingredient)
+    candidate_ingredient = normalized_generic_identity(profile)
+
+    if (
+        not candidate_ingredient
+        or candidate_ingredient != expected_ingredient
+    ):
+        return False
+
+    candidate_strength, candidate_unit = get_profile_strength(profile)
+
+    if (
+        not candidate_strength
+        or candidate_strength != requested_strength
+    ):
+        return False
+
+    if (
+        requested_unit
+        and candidate_unit
+        and requested_unit != candidate_unit
+    ):
+        return False
+
+    return True
+
+
+BRAND_TO_GENERIC_FALLBACK = {
+    "azithral": "azithromycin",
+    "dolo": "paracetamol",
+    "crocin": "paracetamol",
+    "calpol": "paracetamol",
+}
+
+
+# ============================================================
+# MAIN MEDICINE INFORMATION PIPELINE
+# ============================================================
+
+async def get_real_medicine_information(medicine_name: str):
+    medicine_name = normalize_text(medicine_name)
+
+    if not medicine_name:
+        return None
+
+    print(f"\n[HealthGuard] Medicine search: {medicine_name}")
+
+    # ========================================================
+    # STEP 1: CACHE
+    # ========================================================
+
+    cached = await get_cached_medicine(medicine_name)
+
+    if cached:
+        print("[HealthGuard] Returning cached medicine.")
+
+        if looks_like_brand_specific_query(medicine_name):
+            cached_brand = normalize_key(cached.get("brand_name", ""))
+            requested_brand = normalize_key(medicine_name)
+
+            cached_fallback = (
+                cached.get("brand_match_status")
+                == "verified_generic_fallback"
+                and normalize_key(cached.get("matched_query", ""))
+                == requested_brand
+            )
+
+            if cached_brand == requested_brand or cached_fallback:
+                return cached
+
+            print(
+                "[HealthGuard] Cached brand does not exactly match "
+                "the requested brand. Ignoring cached record."
+            )
+        else:
+            return cached
+
+    # ========================================================
+    # STEP 2: INDIAN MEDICINE DATASET
+    # ========================================================
+
+    print("[HealthGuard] Searching Indian medicine dataset...")
+
+    brand_specific_query = looks_like_brand_specific_query(medicine_name)
+
+    try:
+        indian_results = await asyncio.to_thread(
+            search_indian_medicines,
+            medicine_name,
+            limit=10,
+        )
+    except Exception as error:
+        print("[HealthGuard] Indian dataset search failed:", error)
+        indian_results = []
+
+    if not indian_results:
+        print("[HealthGuard] No Indian medicine match.")
+
+        # Never convert an unverified brand into a generic match.
+        if brand_specific_query:
+            print("[HealthGuard] Brand lookup stopped: no verified Indian brand match.")
+            return None
+
+        ingredient = normalize_ingredient_for_api(
+            extract_active_ingredient(medicine_name)
+        )
+
+        if not ingredient:
+            return None
+
+        print("[HealthGuard] Trying international generic sources...")
+
+        rxnorm_result, openfda_result = await asyncio.gather(
+            search_rxnorm(ingredient),
+            search_openfda(ingredient),
+            return_exceptions=True,
+        )
+
+        if isinstance(rxnorm_result, Exception):
+            print("[HealthGuard] RxNorm lookup failed:", rxnorm_result)
+            rxnorm_result = {}
+
+        if isinstance(openfda_result, Exception):
+            print("[HealthGuard] openFDA lookup failed:", openfda_result)
+            openfda_result = {}
+
+        rxnorm_result = rxnorm_result or {}
+        openfda_result = openfda_result or {}
+
+        if not rxnorm_result and not openfda_result:
+            print("[HealthGuard] No international generic information found.")
+            return None
+
+        medicine = merge_medicine_information(
+            {},
+            rxnorm_result,
+            openfda_result,
+        )
+
+        # A generic lookup must not claim an FDA-listed brand as verified.
+        medicine["brand_name"] = ""
+        medicine["generic_name"] = (
+            medicine.get("generic_name") or ingredient
+        )
+        medicine["active_ingredient"] = ingredient
+        medicine["matched_query"] = medicine_name
+        medicine["match_score"] = 0
+        medicine["brand_match_status"] = "generic_query"
+        medicine["identity_note"] = (
+            "Generic ingredient information only. No Indian brand match "
+            "was verified for this search."
+        )
+
+        available_sources = medicine.get("sources") or []
+        if len(available_sources) > 1:
+            medicine["data_status"] = "enriched"
+        elif available_sources:
+            medicine["data_status"] = "single_source"
+        else:
+            medicine["data_status"] = "no_data"
+
+        print("[HealthGuard] International generic information retrieved.")
+        return medicine
+
+    # ========================================================
+    # STEP 3: BRAND-SAFE DATASET MATCH
+    # ========================================================
+
+    brand_specific_query = looks_like_brand_specific_query(
+        medicine_name
+    )
+
+    selected_result = None
+    generic_fallback_used = False
+
+    requested_brand_base, requested_strength, requested_unit = (
+        split_name_and_strength(medicine_name)
+    )
+
+    if brand_specific_query:
+        print("[HealthGuard] Brand-specific query detected.")
+
+        # First preference: exact brand match.
+        for result in indian_results:
+            medicine_row = result.get("medicine")
+
+            if not medicine_row:
+                continue
+
+            candidate_profile = build_indian_medicine_profile(
+                medicine_row
+            )
+
+            if medicine_brand_matches_query(
+                candidate_profile,
+                medicine_name,
+            ):
+                selected_result = result
+
+                print(
+                    "[HealthGuard] EXACT brand match found:",
+                    candidate_profile.get("brand_name", ""),
+                )
+                break
+
+        # Generic fallback is allowed only for known aliases and only
+        # when both ingredient and strength match.
+        if not selected_result:
+            generic_ingredient = BRAND_TO_GENERIC_FALLBACK.get(
+                requested_brand_base
+            )
+
+            if generic_ingredient and requested_strength:
+                print(
+                    "[HealthGuard] Exact brand not found; checking "
+                    "generic fallback:",
+                    generic_ingredient,
+                )
+
+                try:
+                    generic_results = await asyncio.to_thread(
+                        search_indian_medicines,
+                        generic_ingredient,
+                        limit=20,
+                    )
+
+                except Exception as error:
+                    print(
+                        "[HealthGuard] Generic fallback search failed:",
+                        error,
+                    )
+                    generic_results = []
+
+                for result in generic_results or []:
+                    medicine_row = result.get("medicine")
+
+                    if not medicine_row:
+                        continue
+
+                    candidate_profile = build_indian_medicine_profile(
+                        medicine_row
+                    )
+
+                    if profile_matches_generic_strength(
+                        candidate_profile,
+                        generic_ingredient,
+                        requested_strength,
+                        requested_unit,
+                    ):
+                        selected_result = result
+                        generic_fallback_used = True
+
+                        print(
+                            "[HealthGuard] Verified generic fallback found:",
+                            generic_ingredient,
+                            requested_strength,
+                            requested_unit,
+                        )
+                        break
+
+            if not selected_result:
+                print(
+                    "[HealthGuard] No exact brand match or verified "
+                    "ingredient+strength fallback found for:",
+                    medicine_name,
+                )
+                return None
+
+    else:
+        selected_result = indian_results[0]
+
+    # ========================================================
+    # STEP 4: SELECT MEDICINE ROW
+    # ========================================================
+
+    best_result = selected_result
+    indian_row = best_result.get("medicine")
+    score = best_result.get("score", 0)
+
+    if not indian_row:
+        return None
+
+    print("[HealthGuard] Indian match score:", score)
+
+    # ========================================================
+    # STEP 5: INDIAN PROFILE
+    # ========================================================
+
+    indian_profile = build_indian_medicine_profile(indian_row)
+
+    if not indian_profile:
+        return None
+
+    print(
+        "[HealthGuard] Indian medicine:",
+        indian_profile.get("brand_name", ""),
+    )
+
+    # ========================================================
+    # STEP 6: ACTIVE INGREDIENT
+    # ========================================================
+
+    generic_name = indian_profile.get("generic_name", "")
+
+    ingredient = extract_active_ingredient(generic_name)
+    ingredient = normalize_ingredient_for_api(ingredient)
+
+    print("[HealthGuard] API ingredient:", ingredient)
+
+    # ========================================================
+    # STEP 7: RXNORM + OPENFDA
+    # ========================================================
+
+    rxnorm_result, openfda_result = await asyncio.gather(
+        search_rxnorm(ingredient),
+        search_openfda(ingredient),
+        return_exceptions=True,
+    )
+
+    if isinstance(rxnorm_result, Exception):
+        print(
+            "[HealthGuard] RxNorm task failed:",
+            rxnorm_result,
+        )
+        rxnorm_result = {}
+
+    if isinstance(openfda_result, Exception):
+        print(
+            "[HealthGuard] openFDA task failed:",
+            openfda_result,
+        )
+        openfda_result = {}
+
+    print("[HealthGuard] RxNorm available:", bool(rxnorm_result))
+    print("[HealthGuard] openFDA available:", bool(openfda_result))
+    print(
+        "[HealthGuard] openFDA purpose available:",
+        bool(openfda_result.get("purpose")),
+    )
+    print(
+        "[HealthGuard] openFDA indications available:",
+        bool(openfda_result.get("indications")),
+    )
+    print(
+        "[HealthGuard] openFDA warnings available:",
+        bool(openfda_result.get("warnings")),
+    )
+    print(
+        "[HealthGuard] openFDA side effects available:",
+        bool(openfda_result.get("adverse_reactions")),
+    )
+    print(
+        "[HealthGuard] openFDA interactions available:",
+        bool(openfda_result.get("drug_interactions")),
+    )
+
+    # ========================================================
+    # STEP 8: MERGE
+    # ========================================================
+
+    medicine = merge_medicine_information(
+        indian_profile,
+        rxnorm_result,
+        openfda_result,
+    )
+
+    medicine["match_score"] = score
+    medicine["matched_query"] = medicine_name
+    medicine["active_ingredient"] = ingredient
+
+    if generic_fallback_used:
+        medicine["requested_brand"] = requested_brand_base
+        medicine["brand_name"] = ""
+        medicine["brand_match_status"] = "verified_generic_fallback"
+        medicine["identity_note"] = (
+            "The requested brand was not verified. Information is based "
+            "on a matching generic ingredient and strength from the dataset."
+        )
+    elif brand_specific_query:
+        medicine["brand_match_status"] = "exact_brand_match"
+    else:
+        medicine["brand_match_status"] = "generic_query"
+
+    # ========================================================
+    # FINAL BRAND SAFETY CHECK
+    # ========================================================
+
+    if brand_specific_query and not generic_fallback_used:
+        if not medicine_brand_matches_query(
+            medicine,
+            medicine_name,
+        ):
+            print("[HealthGuard] FINAL SAFETY CHECK FAILED.")
+            print("[HealthGuard] Requested brand:", medicine_name)
+            print(
+                "[HealthGuard] Returned brand:",
+                medicine.get("brand_name", ""),
+            )
+            print("[HealthGuard] Rejecting medicine record.")
+            return None
+
+    # ========================================================
+    # FINAL DEBUG
+    # ========================================================
+
+    print(
+        "[HealthGuard] Final medicine information:",
+        bool(medicine.get("medicine_description")),
+    )
+    print(
+        "[HealthGuard] Final warnings:",
+        bool(medicine.get("warnings")),
+    )
+    print(
+        "[HealthGuard] Final side effects:",
+        bool(medicine.get("side_effects")),
+    )
+    print(
+        "[HealthGuard] Final interactions:",
+        bool(medicine.get("drug_interactions")),
+    )
+    print(
+        "[HealthGuard] Final sources:",
+        medicine.get("sources"),
+    )
+
+    # ========================================================
+    # STEP 9: SAVE CACHE
+    # ========================================================
+
+    await save_medicine_cache(medicine_name, medicine)
+
+    print("[HealthGuard] Complete medicine information ready.")
+
+    return medicine

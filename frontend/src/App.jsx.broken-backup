@@ -1,0 +1,128 @@
+
+                <div className="card-header-icon">
+                  <ImagePlus size={23} />
+                </div>
+              </div>
+
+              <div className="upload-section">
+                <div className="upload-icon">
+                  <Upload size={32} />
+                </div>
+
+                <h4>Scan Medicine Package</h4>
+
+                <p>
+                  Upload a clear image of the medicine package to identify the
+                  medicine and extract information.
+                </p>
+
+                <button
+                  className="secondary-button"
+                  onClick={() => handleQuickAction("OCR Scanner")}
+                >
+                  <Upload size={18} />
+                  Choose Image
+                </button>
+              </div>
+            </div>
+
+            {/* ================= RECENT ANALYSIS ================= */}
+
+            <div className="dashboard-card">
+              <div className="card-header">
+                <div>
+                  <h3>Recent Analysis</h3>
+
+                  <p>Recently analyzed medicines and products.</p>
+                </div>
+
+                <Clock3 size={22} />
+              </div>
+
+              <div className="recent-analysis-item">
+                <div className="medicine-icon">
+                  <FileText size={22} />
+                </div>
+
+                <div className="recent-analysis-info">
+                  <strong>Amoxicillin</strong>
+
+                  <span>Medicine information analyzed</span>
+                </div>
+
+                <div className="analysis-status">Completed</div>
+              </div>
+            </div>
+
+            {/* ================= DISCLAIMER ================= */}
+
+            <div className="health-disclaimer">
+              <AlertTriangle size={20} />
+
+              <div>
+                <strong>Educational Information Only</strong>
+
+                <p>
+                  Smart HealthGuard provides educational medicine and product
+                  information. It is not a diagnostic or prescription system.
+                  Always consult a qualified healthcare professional for
+                  medical decisions.
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* ================================================= */}
+        {/* MEDICINE ANALYZER PAGE */}
+        {/* ================================================= */}
+
+        {activePage === "Medicine Analyzer" && <MedicineAnalyzerPage />}
+
+        {/* ================================================= */}
+        {/* OCR SCANNER PAGE */}
+        {/* ================================================= */}
+
+        {activePage === "OCR Scanner" && <OCRScannerPage />}
+
+        {/* ================================================= */}
+        {/* RISK DETECTION */}
+        {/* ================================================= */}
+
+        {activePage === "Risk Detection" && <RiskDetectionPage />}
+
+        {/* ================================================= */}
+        {/* INFORMATION VOICE */}
+        {/* ================================================= */}
+
+        {activePage === "Information Voice" && <InformationVoicePage />}
+
+        {/* ================================================= */}
+        {/* AI ASSISTANT */}
+        {/* ================================================= */}
+
+        {activePage === "AI Assistant" && <AIAssistantPage />}
+
+        {/* ================================================= */}
+        {/* HISTORY */}
+        {/* ================================================= */}
+
+        {activePage === "Analysis History" && (
+          <section className="placeholder-page">
+            <div className="placeholder-icon">
+              <History size={45} />
+            </div>
+
+            <h2>Analysis History</h2>
+
+            <p>
+              View previously analyzed medicines and product information.
+            </p>
+
+            <span className="coming-soon">
+              MODULE READY FOR DEVELOPMENT
+            </span>
+          </section>
+        )}
+      </main>
+    </div>
