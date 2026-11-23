@@ -1310,10 +1310,22 @@ def merge_medicine_information(
     }
 
     if indian:
-        result["sources"].append("Indian medicine dataset")
-        result["information_sources"].append(
-            "Indian medicine dataset"
+        declared_sources = (
+            indian.get("information_sources")
+            or indian.get("sources")
+            or indian.get("source")
         )
+        local_sources = unique_list(
+            flatten_text_values(declared_sources)
+        )
+        if local_sources:
+            result["sources"].extend(local_sources)
+            result["information_sources"].extend(local_sources)
+        else:
+            result["sources"].append("Indian medicine dataset")
+            result["information_sources"].append(
+                "Indian medicine dataset"
+            )
 
     fda_has_information = any([
         fda.get("medicine_description"),
@@ -1442,8 +1454,12 @@ async def get_real_medicine_information(
             ],
             "contraindications": [],
             "drug_interactions": [],
-            "sources": ["Indian medicine dataset"],
-            "information_sources": ["Indian medicine dataset"],
+            "sources": [
+                "Generic metamizole information (not brand-specific)"
+            ],
+            "information_sources": [
+                "Generic metamizole information (not brand-specific)"
+            ],
             "data_status": "available",
         }
 

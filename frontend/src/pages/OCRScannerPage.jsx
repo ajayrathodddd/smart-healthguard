@@ -246,11 +246,17 @@ export default function OCRScannerPage() {
       result?.ocr_dosage_form ||
       "",
   );
+  const ocrDetectedManufacturer = formatText(
+    ocrIdentity.manufacturer_name ||
+      result?.ocr_manufacturer_name ||
+      "",
+  );
   const hasOcrIdentity = Boolean(
     ocrDetectedBrand ||
     ocrDetectedGeneric ||
     ocrDetectedStrength ||
-    ocrDetectedForm,
+    ocrDetectedForm ||
+    ocrDetectedManufacturer,
   );
   const medicineName = medicineVerified ? getMedicineName(medicine) : "";
 
@@ -1285,21 +1291,27 @@ export default function OCRScannerPage() {
               </div>
             </div>
 
-            {hasOcrIdentity && !medicineVerified && (
+            {hasOcrIdentity &&
+              (!medicineVerified || genericStrengthVerified) && (
               <div className="ocr-panel" style={{ marginBottom: "18px" }}>
                 <div className="ocr-panel-body">
                   <div className="ocr-result-label">
                     SCANNER-DETECTED PACKAGE DETAILS
                   </div>
                   <p style={{ margin: "8px 0 14px", color: "#b7791f" }}>
-                    Unverified OCR text - these details have not been confirmed
-                    against a trusted medicine source.
+                    {genericStrengthVerified
+                      ? "Ingredient and strength are verified. Brand and manufacturer below are OCR-only and not independently verified."
+                      : "Unverified OCR text - these details have not been confirmed against a trusted medicine source."}
                   </p>
                   {[
                     ["Brand detected", ocrDetectedBrand],
                     ["Ingredient detected", ocrDetectedGeneric],
                     ["Strength detected", ocrDetectedStrength],
                     ["Dosage form detected", ocrDetectedForm],
+                    [
+                      "Manufacturer printed on package (OCR)",
+                      ocrDetectedManufacturer,
+                    ],
                   ]
                     .filter(([, value]) => value)
                     .map(([label, value]) => (
@@ -1319,7 +1331,7 @@ export default function OCRScannerPage() {
                     ))}
                 </div>
               </div>
-            )}
+              )}
             {/* MEDICINE MATCH */}
 
             <div className="ocr-panel ocr-result-panel">

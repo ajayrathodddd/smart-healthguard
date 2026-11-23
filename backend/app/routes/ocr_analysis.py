@@ -336,7 +336,25 @@ def extract_medicine_identity(ocr_text: str):
         "generic_name": extract_generic_name(ocr_text),
         "strength": extract_strength(ocr_text),
         "dosage_form": extract_dosage_form(ocr_text),
+        "manufacturer_name": extract_manufacturer_name(ocr_text),
     }
+
+
+def extract_manufacturer_name(ocr_text: str):
+    if not ocr_text:
+        return ""
+
+    company_suffix = re.compile(
+        r"\b(?:AG|GMBH|LTD\.?|LIMITED|PVT\.?|PLC|INC\.?|CORP(?:ORATION)?)\b",
+        re.IGNORECASE,
+    )
+
+    for line in ocr_text.splitlines():
+        candidate = clean_ocr_line(line)
+        if company_suffix.search(candidate) and len(candidate.split()) >= 2:
+            return candidate
+
+    return ""
 
 
 # ============================================================
