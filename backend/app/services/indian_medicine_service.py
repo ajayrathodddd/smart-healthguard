@@ -512,12 +512,24 @@ def _score_medicine(query: str, row: Dict[str, str]) -> int:
     if not normalized_query:
         return 0
 
+    requested_strength = _extract_strength(query)
+    name_query = normalized_query
+
+    if requested_strength:
+        name_query = re.sub(
+            r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|μg|g|ml|iu)\b",
+            " ",
+            name_query,
+            flags=re.IGNORECASE,
+        )
+        name_query = normalize_text(name_query)
+
     name = normalize_text(_medicine_name(row))
     composition_1 = _composition_1(row)
     composition_2 = _composition_2(row)
 
     name_compact = compact_text(name)
-    query_compact = compact_text(normalized_query)
+    query_compact = compact_text(name_query)
 
     composition_ingredients = (
         _extract_ingredient_names(composition_1)
@@ -528,21 +540,21 @@ def _score_medicine(query: str, row: Dict[str, str]) -> int:
     score = 0
 
     # Exact full medicine name.
-    if name == normalized_query or (
+    if name == name_query or (
         query_compact and name_compact == query_compact
     ):
         score = 5000
 
     else:
         # Exact phrase in a medicine name.
-        phrase_match = _contains_word(name, normalized_query)
+        phrase_match = _contains_word(name, name_query)
 
         # Do not give combination medicines the same score
         # as a standalone medicine for a generic ingredient query.
         if phrase_match and len(composition_ingredients) <= 1:
             score = 3500
 
-        elif len(normalized_query) >= 4 and normalized_query in name:
+        elif len(name_query) >= 4 and name_query in name:
             score = 2200
 
         elif (
@@ -565,8 +577,6 @@ def _score_medicine(query: str, row: Dict[str, str]) -> int:
                     score = max(score, 1200)
 
     # Match requested strength.
-    requested_strength = _extract_strength(query)
-
     if requested_strength:
         amount, unit = requested_strength
 
@@ -629,6 +639,11 @@ def _collect_top_results(
 
         if fuzzy:
             if score < 250:
+                continue
+            if (
+                _extract_strength(query)
+                and _score_medicine(query, row) < 800
+            ):
                 continue
         elif score < 800:
             continue

@@ -143,6 +143,12 @@ def extract_text_from_image(image_bytes: bytes) -> str:
                     f"{view_name}, variant {variant_index}, {config}",
                 )
 
+        if view_name == "full" and max(
+            (_text_score(text) for text in results),
+            default=0,
+        ) >= 40:
+            break
+
     best_score = max(
         (_text_score(text) for text in results),
         default=0,

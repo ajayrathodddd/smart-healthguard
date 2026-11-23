@@ -723,11 +723,10 @@ export default function OCRScannerPage() {
   async function speakText() {
     if (isSpeaking) {
       const audio = document.getElementById("ocr-voice-audio");
-      if (audio) {
-        audio.pause();
-      } else if (typeof window !== "undefined" && window.speechSynthesis) {
+      if (typeof window !== "undefined" && window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
+      audio?.pause();
       setIsSpeaking(false);
       return;
     }
@@ -736,14 +735,36 @@ export default function OCRScannerPage() {
       setIsTranslating(true);
       setError("");
 
+      if (
+        !medicineVerified &&
+        language === "en" &&
+        typeof window !== "undefined" &&
+        window.speechSynthesis &&
+        typeof window.SpeechSynthesisUtterance !== "undefined"
+      ) {
+        const utterance = new SpeechSynthesisUtterance(
+          `Medicine identity could not be verified. Text extracted from the package: ${extractedText.slice(0, 350)}`,
+        );
+        utterance.lang = getSpeechLanguage(language);
+        utterance.rate = 0.9;
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => setIsSpeaking(false);
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          setError("Voice playback is unavailable for this language.");
+        };
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utterance);
+        return;
+      }
+
       const voiceName = medicineVerified
         ? (medicineName || composition || "Verified medicine")
         : "Unverified OCR medicine package";
 
       const voiceDescription = medicineVerified
         ? medicineInformation
-        : "Medicine identity could not be verified. The following OCR text was extracted. " +
-          extractedText.slice(0, 350);
+        : extractedText.slice(0, 350);
 
       const data = await generateVoiceExplanation(
         voiceName,

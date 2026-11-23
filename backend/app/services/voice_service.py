@@ -231,6 +231,15 @@ def build_explanation(
     medicine_name = clean_text(medicine_name)
     composition = clean_text(composition)
     description = clean_text(description)
+
+    if medicine_name == "Unverified OCR medicine package":
+        extracted_text = description or "No readable package text was extracted."
+        return (
+            "The medicine identity could not be verified. "
+            f"Text extracted from the package: {extracted_text[:350]}. "
+            "OCR can contain errors. Confirm the package with a pharmacist."
+        )
+
     side_effects_text = clean_side_effects(side_effects)
     safety_summary = extract_safety_summary(
         warnings=warnings,

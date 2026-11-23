@@ -259,11 +259,45 @@ def extract_brand_name(ocr_text: str):
         "enthalt", "enthalten", "enthält", "natrium",
     }
 
+    dosage_forms = (
+        "tablets?", "tablettes?", "tabletten", "capsules?", "kapseln?",
+        "syrup", "suspension", "injection", "injektion", "cream", "creme",
+        "ointment", "salbe", "drops?", "tropfen", "suppositories?",
+    )
+    dosage_pattern = re.compile(
+        r"\b(?:" + "|".join(dosage_forms) + r")\b",
+        re.IGNORECASE,
+    )
+    strength_pattern = re.compile(
+        r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|iu)\b",
+        re.IGNORECASE,
+    )
+
+    def clean_candidate(line: str) -> str:
+        candidate = line.strip(" \t:;,.|")
+        candidate = strength_pattern.sub(" ", candidate)
+        candidate = dosage_pattern.sub(" ", candidate)
+
+        for generic in KNOWN_GENERIC_NAMES:
+            candidate = re.sub(
+                rf"\b{re.escape(generic)}\b",
+                " ",
+                candidate,
+                flags=re.IGNORECASE,
+            )
+
+        candidate = re.sub(r"\s+", " ", candidate).strip(" \t:;,.|-")
+
+        if extract_strength(candidate):
+            candidate = re.sub(r"[- ]\d{2,5}$", "", candidate).strip()
+
+        return candidate
+
     # Count repeated alphabetic candidates.
     counts = {}
 
     for line in lines:
-        candidate = line.strip(" \t:;,.|")
+        candidate = clean_candidate(line)
         if re.fullmatch(r"[A-Za-z][A-Za-z-]{3,30}", candidate):
             normalized = candidate.lower()
             if normalized not in ignored:
@@ -275,7 +309,7 @@ def extract_brand_name(ocr_text: str):
 
     # Fallback: only accept a plausible standalone alphabetic name.
     for line in lines:
-        candidate = line.strip(" \t:;,.|")
+        candidate = clean_candidate(line)
         if (
             re.fullmatch(r"[A-Za-z][A-Za-z-]{3,30}", candidate)
             and candidate.lower() not in ignored
@@ -1255,15 +1289,18 @@ async def find_medicine_from_identity(
     # ========================================================
 
     if brand:
+        brand_query = " ".join(
+            value for value in (brand, strength) if value
+        )
         print(
             "[HealthGuard OCR] Brand search:",
-            brand,
+            brand_query,
         )
 
         try:
             medicine_info = (
                 await get_real_medicine_information(
-                    brand
+                    brand_query
                 )
             )
 
