@@ -223,8 +223,15 @@ Create the appropriate `.env` file in the location expected by the backend and c
 Example:
 
 ```env
-MONGODB_URI=your_mongodb_connection_string
+MONGODB_URL=your_mongodb_connection_string
+DATABASE_NAME=smart_healthguard
 ```
+
+For Render, set `MONGODB_URL` to a reachable MongoDB connection string (not
+`localhost`) and set `DATABASE_NAME` on the backend. Also set `FRONTEND_URL` on
+the backend to `https://smart-healthguard-frontend.onrender.com` and
+`VITE_API_BASE_URL` on the frontend to `https://smart-healthguard.onrender.com`.
+The frontend URL is also included in the backend CORS allowlist.
 
 Add other variables required by your configured integrations.
 

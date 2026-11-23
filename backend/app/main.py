@@ -47,6 +47,7 @@ frontend_url = os.getenv(
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://smart-healthguard-frontend.onrender.com",
 ]
 
 if frontend_url not in allowed_origins:
