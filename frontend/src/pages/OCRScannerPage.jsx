@@ -1307,9 +1307,9 @@ export default function OCRScannerPage() {
                   </div>
                   <p style={{ margin: "8px 0 14px", color: "#b7791f" }}>
                     {genericStrengthVerified
-                      ? "Ingredient and strength are verified. Brand and manufacturer below are OCR-only and not independently verified."
+                      ? "Ingredient and strength are verified. Brand, dosage form, and manufacturer below are OCR-only unless confirmed by a source."
                       : genericVerified
-                        ? "Ingredient is verified. Brand and strength are not verified; only general ingredient information is shown."
+                        ? "Ingredient is verified. Brand, strength, dosage form, and manufacturer are unverified; only general ingredient information is shown."
                       : "Unverified OCR text - these details have not been confirmed against a trusted medicine source."}
                   </p>
                   {[

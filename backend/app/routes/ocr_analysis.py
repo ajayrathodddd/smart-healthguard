@@ -718,8 +718,18 @@ def profile_matches_identity(
     if strength and not strength_match:
         return False
 
-    if dosage_form and not dosage_match:
-        return False
+    if dosage_form:
+        known_forms = {
+            form
+            for aliases in dosage_aliases.values()
+            for form in aliases
+        }
+        profile_form_known = any(
+            re.search(rf"\b{re.escape(form)}\b", form_text)
+            for form in known_forms
+        )
+        if profile_form_known and not dosage_match:
+            return False
 
     # If OCR also detected a generic ingredient, a brand-name match
     # cannot override a conflicting generic identity.
@@ -817,7 +827,7 @@ async def build_generic_strength_verified_result(
         "warnings": enriched.get("warnings", ""),
         "contraindications": enriched.get("contraindications", ""),
         "drug_interactions": enriched.get("drug_interactions", ""),
-        "dosage_form": identity.get("dosage_form", "") or enriched.get("dosage_form", ""),
+        "dosage_form": enriched.get("dosage_form", ""),
         "route": enriched.get("route", ""),
         "dosage_and_administration": enriched.get("dosage_and_administration", ""),
         "pregnancy": enriched.get("pregnancy", ""),
@@ -1718,6 +1728,79 @@ async def analyze_medicine_image(
             # =================================================
 
             if brand_verified:
+                clinical_fields = (
+                    "medicine_description",
+                    "description",
+                    "purpose",
+                    "indications",
+                    "side_effects",
+                    "adverse_reactions",
+                    "warnings",
+                    "contraindications",
+                    "drug_interactions",
+                    "pregnancy",
+                )
+                missing_clinical_fields = [
+                    field
+                    for field in clinical_fields
+                    if not medicine.get(field)
+                ]
+                generic_name = identity.get("generic_name") or extract_generic_name(
+                    " ".join(
+                        str(medicine.get(field) or "")
+                        for field in (
+                            "generic_name",
+                            "composition_2",
+                            "active_ingredient",
+                        )
+                    )
+                )
+
+                if missing_clinical_fields and generic_name:
+                    generic_strength = identity.get("strength") or extract_strength(
+                        " ".join(
+                            str(medicine.get(field) or "")
+                            for field in (
+                                "generic_name",
+                                "composition_2",
+                                "active_ingredient",
+                            )
+                        )
+                    )
+                    generic_information = (
+                        await build_generic_strength_verified_result(
+                            medicine,
+                            {
+                                **identity,
+                                "generic_name": generic_name,
+                                "strength": generic_strength,
+                            },
+                        )
+                    )
+                    for field in missing_clinical_fields:
+                        if generic_information.get(field):
+                            medicine[field] = generic_information[field]
+
+                    existing_sources = medicine.get("sources") or []
+                    if not isinstance(existing_sources, list):
+                        existing_sources = [existing_sources]
+                    generic_sources = generic_information.get("sources") or []
+                    if not isinstance(generic_sources, list):
+                        generic_sources = [generic_sources]
+                    medicine["sources"] = list(
+                        dict.fromkeys(
+                            source
+                            for source in existing_sources + generic_sources
+                            if source
+                        )
+                    )
+                    if any(medicine.get(field) for field in missing_clinical_fields):
+                        medicine["verification_message"] = (
+                            "The brand matched the medicine database. General "
+                            "ingredient information supplements fields that "
+                            "were empty in the product record."
+                        )
+
                 medicine["ocr_brand_name"] = identity.get("brand_name", "")
                 medicine["ocr_generic_name"] = identity.get("generic_name", "")
                 medicine["ocr_strength"] = identity.get("strength", "")
@@ -1733,7 +1816,10 @@ async def analyze_medicine_image(
                     "ocr_identity": identity,
                     "matched_text": matched_medicine["matched_text"],
                     "match_type": "verified_brand",
-                    "verification_message": "Brand name matched the database result.",
+                    "verification_message": medicine.get(
+                        "verification_message",
+                        "Brand name matched the database result.",
+                    ),
                     "medicine": medicine,
                 }
 
