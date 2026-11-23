@@ -71,6 +71,14 @@ def normalize_brand_identity(value: str) -> str:
     """
     value = normalize_ocr_text(value or "")
     value = re.sub(
+        r"\s+\b(?:tablets?|tablettes?|tabletten|capsules?|kapseln?|"
+        r"syrup|suspension|injection|injektion|cream|creme|ointment|"
+        r"salbe|drops?|tropfen|suppositories?)\b$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(
         r"[- ]\d{2,5}(?:\s*(?:mg|mcg|g|ml))?$",
         "",
         value,
@@ -1318,6 +1326,22 @@ async def find_medicine_from_identity(
                             "verified_ocr_identity"
                         ),
                     }
+
+                database_brand = str(
+                    medicine_info.get("brand_name", "")
+                )
+                if (
+                    normalize_brand_identity(brand)
+                    and normalize_brand_identity(brand)
+                    == normalize_brand_identity(database_brand)
+                ):
+                    print(
+                        "[HealthGuard OCR] Recognized brand conflicts "
+                        "with the detected ingredient, strength, or form; "
+                        "withholding medicine details:",
+                        brand,
+                    )
+                    return None
 
             print(
                 "[HealthGuard OCR] Brand was not "
