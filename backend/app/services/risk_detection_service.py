@@ -1,3 +1,4 @@
+
 from typing import Any
 
 
@@ -10,13 +11,22 @@ def _is_missing(value: Any) -> bool:
     if isinstance(value, str):
         return not value.strip()
 
-    if isinstance(value, list):
-        return len(value) == 0
-
-    if isinstance(value, dict):
+    if isinstance(value, (list, dict, tuple, set)):
         return len(value) == 0
 
     return False
+
+
+def _first_available(medicine: dict, *keys: str) -> Any:
+    """Return the first field containing useful information."""
+
+    for key in keys:
+        value = medicine.get(key)
+
+        if not _is_missing(value):
+            return value
+
+    return None
 
 
 def _is_discontinued(value: Any) -> bool:
@@ -24,6 +34,9 @@ def _is_discontinued(value: Any) -> bool:
 
     if value is None:
         return False
+
+    if isinstance(value, bool):
+        return value
 
     value = str(value).strip().lower()
 
@@ -33,6 +46,20 @@ def _is_discontinued(value: Any) -> bool:
         "1",
         "discontinued",
     }
+
+
+def _format_value(value: Any) -> str:
+    """Convert available information into readable text."""
+
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+
+    if isinstance(value, dict):
+        return ", ".join(
+            f"{key}: {item}" for key, item in value.items()
+        )
+
+    return str(value)
 
 
 def _add_indicator(
@@ -66,8 +93,12 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     automatically increase the suspicious-product score.
 
     This system does NOT prove that a medicine is genuine
-    or counterfeit.
+    or counterfeit, and it does NOT determine whether a
+    medicine is medically safe for an individual.
     """
+
+    if not isinstance(medicine, dict):
+        medicine = {}
 
     score = 0
 
@@ -79,11 +110,13 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 1. MEDICINE IDENTITY
     # =========================================================
 
-    medicine_name = (
-        medicine.get("indian_brand")
-        or medicine.get("brand_name")
-        or medicine.get("medicine_name")
-        or medicine.get("searched_name")
+    medicine_name = _first_available(
+        medicine,
+        "indian_brand",
+        "brand_name",
+        "medicine_name",
+        "searched_name",
+        "name",
     )
 
     if _is_missing(medicine_name):
@@ -103,7 +136,7 @@ def calculate_medicine_risk(medicine: dict) -> dict:
         positive_checks.append(
             {
                 "title": "Medicine identity identified",
-                "description": str(medicine_name),
+                "description": _format_value(medicine_name),
             }
         )
 
@@ -111,12 +144,12 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 2. ACTIVE INGREDIENT / COMPOSITION
     # =========================================================
 
-    indian_generic = medicine.get("indian_generic")
-
-    generic_name = (
-        indian_generic
-        or medicine.get("generic_name")
-        or medicine.get("active_ingredient")
+    generic_name = _first_available(
+        medicine,
+        "indian_generic",
+        "generic_name",
+        "active_ingredient",
+        "composition",
     )
 
     if _is_missing(generic_name):
@@ -136,7 +169,7 @@ def calculate_medicine_risk(medicine: dict) -> dict:
         positive_checks.append(
             {
                 "title": "Active ingredient identified",
-                "description": str(generic_name),
+                "description": _format_value(generic_name),
             }
         )
 
@@ -144,9 +177,10 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 3. MANUFACTURER
     # =========================================================
 
-    manufacturer = (
-        medicine.get("indian_manufacturer")
-        or medicine.get("manufacturer")
+    manufacturer = _first_available(
+        medicine,
+        "indian_manufacturer",
+        "manufacturer",
     )
 
     if _is_missing(manufacturer):
@@ -166,7 +200,7 @@ def calculate_medicine_risk(medicine: dict) -> dict:
         positive_checks.append(
             {
                 "title": "Manufacturer information available",
-                "description": str(manufacturer),
+                "description": _format_value(manufacturer),
             }
         )
 
@@ -174,7 +208,13 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 4. MEDICINE TYPE
     # =========================================================
 
-    medicine_type = medicine.get("indian_medicine_type")
+    medicine_type = _first_available(
+        medicine,
+        "indian_medicine_type",
+        "dosage_form",
+        "medicine_type",
+        "product_type",
+    )
 
     if _is_missing(medicine_type):
         score += 5
@@ -186,14 +226,14 @@ def calculate_medicine_risk(medicine: dict) -> dict:
             "Medicine type unavailable",
             (
                 "The available dataset does not specify "
-                "the medicine type."
+                "the medicine type or dosage form."
             ),
         )
     else:
         positive_checks.append(
             {
                 "title": "Medicine type available",
-                "description": str(medicine_type),
+                "description": _format_value(medicine_type),
             }
         )
 
@@ -201,7 +241,13 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 5. PACK INFORMATION
     # =========================================================
 
-    pack_size = medicine.get("indian_pack_size")
+    pack_size = _first_available(
+        medicine,
+        "indian_pack_size",
+        "pack_size",
+        "package_size",
+        "pack_information",
+    )
 
     if _is_missing(pack_size):
         score += 5
@@ -220,7 +266,7 @@ def calculate_medicine_risk(medicine: dict) -> dict:
         positive_checks.append(
             {
                 "title": "Pack information available",
-                "description": str(pack_size),
+                "description": _format_value(pack_size),
             }
         )
 
@@ -228,10 +274,13 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 6. DISCONTINUED STATUS
     # =========================================================
 
-    discontinued = (
-        medicine.get("indian_discontinued")
-        or medicine.get("is_discontinued")
-    )
+    # Preserve False as a meaningful value instead of using
+    # "or", which can accidentally ignore an explicit False.
+
+    if "indian_discontinued" in medicine:
+        discontinued = medicine.get("indian_discontinued")
+    else:
+        discontinued = medicine.get("is_discontinued")
 
     if _is_discontinued(discontinued):
         score += 30
@@ -261,7 +310,13 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 7. SOURCE VERIFICATION
     # =========================================================
 
-    source = medicine.get("source")
+    source = _first_available(
+        medicine,
+        "source",
+        "sources",
+        "information_sources",
+        "data_sources",
+    )
 
     if _is_missing(source):
         score += 10
@@ -277,25 +332,23 @@ def calculate_medicine_risk(medicine: dict) -> dict:
             ),
         )
     else:
-        if isinstance(source, list):
-            source_text = ", ".join(
-                str(item) for item in source
-            )
-        else:
-            source_text = str(source)
-
         positive_checks.append(
             {
                 "title": "Medicine information has known sources",
-                "description": source_text,
+                "description": _format_value(source),
             }
         )
 
     # =========================================================
-    # 8. SAFETY INFORMATION
+    # 8. SAFETY WARNINGS
     # =========================================================
 
-    warnings = medicine.get("warnings")
+    warnings = _first_available(
+        medicine,
+        "warnings",
+        "safety_warnings",
+        "precautions",
+    )
 
     if not _is_missing(warnings):
         safety_information.append(
@@ -326,9 +379,11 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 9. SIDE EFFECT INFORMATION
     # =========================================================
 
-    side_effects = (
-        medicine.get("indian_side_effects")
-        or medicine.get("adverse_reactions")
+    side_effects = _first_available(
+        medicine,
+        "indian_side_effects",
+        "side_effects",
+        "adverse_reactions",
     )
 
     if not _is_missing(side_effects):
@@ -360,9 +415,11 @@ def calculate_medicine_risk(medicine: dict) -> dict:
     # 10. DRUG INTERACTION INFORMATION
     # =========================================================
 
-    interactions = (
-        medicine.get("indian_drug_interactions")
-        or medicine.get("drug_interactions")
+    interactions = _first_available(
+        medicine,
+        "indian_drug_interactions",
+        "drug_interactions",
+        "interactions",
     )
 
     if not _is_missing(interactions):
@@ -424,7 +481,9 @@ def calculate_medicine_risk(medicine: dict) -> dict:
             "No major suspicious-product indicators detected",
             (
                 "The available medicine information did not "
-                "identify major suspicious-product indicators."
+                "identify major suspicious-product indicators. "
+                "This does not establish product authenticity "
+                "or medical safety."
             ),
         )
 
@@ -440,9 +499,12 @@ def calculate_medicine_risk(medicine: dict) -> dict:
         "verification_checks": positive_checks,
         "safety_information": safety_information,
         "assessment": (
-            "This is an informational screening result based "
-            "on available medicine data and predefined rules. "
-            "It does not prove that a medicine is genuine "
-            "or counterfeit."
+            "This is an informational product-data screening "
+            "result based on available medicine data and "
+            "predefined rules. A low score does not mean that "
+            "a medicine is medically safe or suitable for an "
+            "individual. This result does not prove that a "
+            "medicine is genuine or counterfeit. Consult a "
+            "qualified healthcare professional for medical advice."
         ),
     }

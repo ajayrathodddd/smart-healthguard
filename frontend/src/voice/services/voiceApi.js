@@ -13,6 +13,27 @@ export async function getSupportedLanguages() {
   return response.json();
 }
 
+function normalizeMedicineField(value) {
+  if (value === null || value === undefined) return "";
+
+  if (typeof value === "string") return value.trim();
+
+  if (Array.isArray(value)) {
+    return value
+      .map(normalizeMedicineField)
+      .filter(Boolean)
+      .join(". ");
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value)
+      .map(normalizeMedicineField)
+      .filter(Boolean)
+      .join(". ");
+  }
+
+  return String(value);
+}
 export async function generateVoiceExplanation(
   medicineName,
   language,
@@ -32,16 +53,16 @@ export async function generateVoiceExplanation(
         language: language,
 
         composition:
-          medicineData.composition || "",
+          normalizeMedicineField(medicineData.composition),
 
         description:
-          medicineData.description || "",
+          normalizeMedicineField(medicineData.description),
 
         side_effects:
-          medicineData.sideEffects || "",
+          normalizeMedicineField(medicineData.sideEffects),
 
         warnings:
-          medicineData.warnings || "",
+          normalizeMedicineField(medicineData.warnings),
       }),
     }
   );
@@ -66,3 +87,5 @@ export function getAudioUrl(audioFile) {
 
   return `${API_BASE_URL}${audioFile}`;
 }
+
+

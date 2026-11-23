@@ -1,4 +1,4 @@
-
+﻿
 import { useState } from "react";
 import { auth } from "../firebase";
 import {
@@ -176,19 +176,28 @@ function MedicineAnalyzerPage() {
     "Not available";
 
   const medicineType =
-    medicine?.indian_medicine_type || "Not available";
+    medicine?.indian_medicine_type || medicine?.dosage_form || "Not available";
 
   const packSize =
-    medicine?.indian_pack_size || "Not available";
+    medicine?.indian_pack_size || medicine?.pack_size || "Not available";
 
   const description =
-    medicine?.indian_description ||
+    medicine?.indian_description || medicine?.medicine_description ||
     medicine?.indications ||
     medicine?.purpose ||
-    "No description is available for this medicine.";
+    "";
+
+  const displayedDescription =
+    description ||
+    [
+      `${displayName} is a ${medicineType.toLowerCase()} medicine.`,
+      `Its composition is ${composition}.`,
+      `The available pack size is ${packSize}.`,
+      "Consult a qualified healthcare professional for correct use.",
+    ].join(" ");
 
   const sideEffects =
-    medicine?.indian_side_effects ||
+    medicine?.indian_side_effects || medicine?.side_effects ||
     medicine?.adverse_reactions ||
     "Information not available.";
 
@@ -231,18 +240,25 @@ function MedicineAnalyzerPage() {
      DATA SOURCES
   ========================================================= */
 
-  const sources = Array.isArray(medicine?.source)
-    ? medicine.source
-    : [];
+  const sources = Array.isArray(medicine?.information_sources)
+    ? medicine.information_sources
+    : Array.isArray(medicine?.sources)
+      ? medicine.sources
+      : Array.isArray(medicine?.source)
+        ? medicine.source
+        : [];
 
   /* =========================================================
      PRODUCT STATUS
   ========================================================= */
 
+  const discontinuedValue =
+    medicine?.indian_discontinued ?? medicine?.is_discontinued;
+
   const discontinuedStatus =
-    medicine?.indian_discontinued === "FALSE"
+    String(discontinuedValue).toUpperCase() === "FALSE"
       ? "Active"
-      : medicine?.indian_discontinued === "TRUE"
+      : String(discontinuedValue).toUpperCase() === "TRUE"
         ? "Discontinued"
         : "Not available";
 
@@ -277,26 +293,54 @@ function MedicineAnalyzerPage() {
      SIDE EFFECT FORMATTER
   ========================================================= */
 
-  const getSideEffectList = (value) => {
-    if (!value) {
-      return [];
-    }
+ const getSideEffectList = (value) => {
+  if (!value) {
+    return [
+      "No medicine-specific side-effect information was returned.",
+      "Read the package leaflet before using this medicine.",
+      "Ask a pharmacist about possible reactions and precautions.",
+      "Seek medical help for severe or allergic reactions.",
+    ];
+  }
 
-    if (Array.isArray(value)) {
-      return value
-        .map((item) => String(item).trim())
-        .filter(Boolean);
-    }
+  if (
+    typeof value === "string" &&
+    /information not available|no (common )?side effects/i.test(value)
+  ) {
+    return [
+      "No medicine-specific side-effect information was returned.",
+      "Read the package leaflet before using this medicine.",
+      "Ask a pharmacist about possible reactions and precautions.",
+      "Seek medical help for severe or allergic reactions.",
+    ];
+  }
 
-    if (typeof value === "string") {
-      return value
-        .split(/[,;|]+/)
-        .map((item) => item.trim())
-        .filter(Boolean);
-    }
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item).trim())
+     .filter(Boolean)
+     .slice(0, 4);
+  }
 
-    return [String(value)];
-  };
+  if (typeof value === "string") {
+    return value
+      .split(/\r?\n|[;|]+/)
+      .map((item) => item.trim())
+     .filter(Boolean)
+     .slice(0, 4);
+  }
+
+  const text = String(value).trim();
+  if (!text) {
+    return [
+     "No medicine-specific side-effect information was returned.",
+     "Read the package leaflet before using this medicine.",
+     "Ask a pharmacist about possible reactions and precautions.",
+     "Seek medical help for severe or allergic reactions.",
+    ];
+  }
+  return [text].slice(0, 4);
+};
 
   /* =========================================================
      MEDICINE DESCRIPTION FORMATTER
@@ -318,31 +362,10 @@ function MedicineAnalyzerPage() {
     const sentences = text
       .split(/(?<=[.!?])\s+/)
       .map((sentence) => sentence.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .slice(0, 4);
 
-    if (sentences.length <= 2) {
-      return [text];
-    }
-
-    const paragraphs = [];
-    let currentParagraph = [];
-
-    sentences.forEach((sentence, index) => {
-      currentParagraph.push(sentence);
-
-      if (
-        currentParagraph.length >= 2 ||
-        index === sentences.length - 1
-      ) {
-        paragraphs.push(
-          currentParagraph.join(" "),
-        );
-
-        currentParagraph = [];
-      }
-    });
-
-    return paragraphs;
+    return sentences.length > 0 ? sentences : [text];
   };
 
   /* =========================================================
@@ -350,10 +373,34 @@ function MedicineAnalyzerPage() {
   ========================================================= */
 
   const getSafetySections = (value) => {
-    if (!value) {
+    if (
+      !value ||
+      /warning information not available/i.test(String(value))
+    ) {
       return {
         contraindications: [],
-        warnings: [],
+        warnings: [
+          {
+            number: "1",
+            title: "Use only as directed",
+            content: "Follow the directions on the verified package label and from a healthcare professional.",
+          },
+          {
+            number: "2",
+            title: "Existing conditions",
+            content: "Tell a healthcare professional about allergies, pregnancy, breastfeeding, or medical conditions.",
+          },
+          {
+            number: "3",
+            title: "Other medicines",
+            content: "Check with a pharmacist before combining this medicine with other medicines or supplements.",
+          },
+          {
+            number: "4",
+            title: "Serious reactions",
+            content: "Stop use and seek medical help if you develop severe reactions or difficulty breathing.",
+          },
+        ].slice(0, 4),
       };
     }
 
@@ -436,7 +483,7 @@ function MedicineAnalyzerPage() {
         }
 
         content = content
-          .replace(/^[-•:)\s]+/, "")
+          .replace(/^[-â€¢:)\s]+/, "")
           .trim();
 
         const title =
@@ -480,8 +527,8 @@ function MedicineAnalyzerPage() {
       });
 
       return {
-        contraindications,
-        warnings,
+        contraindications: contraindications.slice(0, 5),
+        warnings: warnings.slice(0, 5),
       };
     }
 
@@ -538,7 +585,8 @@ function MedicineAnalyzerPage() {
             number: String(index + 1),
             title: "Important Safety Information",
             content,
-          })),
+          }))
+          .slice(0, 5),
         );
       } else {
         warnings.push({
@@ -569,9 +617,21 @@ function MedicineAnalyzerPage() {
   const renderInteractionContent = () => {
     if (!interactions) {
       return (
-        <p className="medicine-muted-text">
-          No interaction information available.
-        </p>
+        <div className="interaction-list">
+          {[
+            "No medicine-specific interaction data was returned.",
+            "Tell a pharmacist about all medicines you use.",
+            "Ask before combining this medicine with supplements.",
+            "Follow the verified package label and professional advice.",
+          ].map((item, index) => (
+            <div className="interaction-item" key={index}>
+              <div className="interaction-number">{index + 1}</div>
+              <div className="interaction-details">
+                <p>{item}</p>
+              </div>
+            </div>
+          ))}
+        </div>
       );
     }
 
@@ -588,7 +648,7 @@ function MedicineAnalyzerPage() {
 
       return (
         <div className="interaction-list">
-          {drugs.map((drug, index) => (
+          {drugs.slice(0, 5).map((drug, index) => (
             <div
               className="interaction-item"
               key={`${drug}-${index}`}
@@ -622,7 +682,7 @@ function MedicineAnalyzerPage() {
     if (Array.isArray(interactions)) {
       return (
         <div className="interaction-list">
-          {interactions.map((item, index) => (
+          {interactions.slice(0, 5).map((item, index) => (
             <div
               className="interaction-item"
               key={index}
@@ -632,18 +692,38 @@ function MedicineAnalyzerPage() {
               </div>
 
               <div className="interaction-details">
-                <p>{formatText(item)}</p>
+                {item && typeof item === "object" ? (
+                  <>
+                    <strong className="interaction-drug">
+                      {item.drug || "Drug information"}
+                    </strong>
+
+                    {item.brand && (
+                      <p className="interaction-brands">
+                        <strong>Related brands:</strong>{" "}
+                        {String(item.brand).trim()}
+                      </p>
+                    )}
+
+                    {item.effect && (
+                      <span className="interaction-effect">
+                        {String(item.effect).replace(/_/g, " ")}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <p>{formatText(item)}</p>
+                )}
               </div>
             </div>
           ))}
         </div>
       );
     }
-
     if (typeof interactions === "object") {
       return (
         <div className="interaction-list">
-          {Object.entries(interactions).map(
+          {Object.entries(interactions).slice(0, 5).map(
             ([key, value], index) => (
               <div
                 className="interaction-item"
@@ -912,7 +992,7 @@ function MedicineAnalyzerPage() {
                 <span>WHAT THIS MEDICINE IS USED FOR</span>
 
                 <div className="medicine-description-paragraphs">
-                  {getDescriptionParagraphs(description).map(
+                  {getDescriptionParagraphs(displayedDescription).map(
                     (paragraph, index) => (
                       <p key={index}>{paragraph}</p>
                     ),
@@ -978,7 +1058,7 @@ function MedicineAnalyzerPage() {
               </div>
 
               <div className="warning-sections">
-                {contraindications.map(
+                {contraindications.slice(0, 5).map(
                   (contraindication, index) => (
                     <div
                       className="warning-item"
@@ -1022,7 +1102,7 @@ function MedicineAnalyzerPage() {
               </div>
 
               <div className="warning-sections">
-                {warnings.map((warning, index) => (
+                {warnings.slice(0, 5).map((warning, index) => (
                   <div
                     className="warning-item"
                     key={`${warning.number}-${index}`}
@@ -1095,7 +1175,7 @@ function MedicineAnalyzerPage() {
                 <div>
                   <span>RxNorm ID</span>
                   <strong>
-                    {medicine.rxcui || "Not available"}
+                    {medicine.rxnorm_id || medicine.rxcui || "Not available"}
                   </strong>
                 </div>
               </div>
@@ -1108,11 +1188,7 @@ function MedicineAnalyzerPage() {
                 <div>
                   <span>Data Sources</span>
                   <strong>
-                    {sources.length > 0
-                      ? `${sources.length} source${
-                          sources.length > 1 ? "s" : ""
-                        } available`
-                      : "Not available"}
+                    {sources.length > 0 ? sources.join(", ") : "Not available"}
                   </strong>
                 </div>
               </div>
@@ -1158,7 +1234,7 @@ function MedicineAnalyzerPage() {
           <MedicineVoiceSummary
             medicineName={displayName}
             composition={composition}
-            description={description}
+            description={displayedDescription}
             sideEffects={sideEffects}
             warnings={rawWarnings}
           />
@@ -1198,3 +1274,5 @@ function MedicineAnalyzerPage() {
 }
 
 export default MedicineAnalyzerPage;
+
+

@@ -20,6 +20,10 @@ import {
 
 import "./OCRScannerPage.css";
 import { auth } from "../firebase";
+import {
+  generateVoiceExplanation,
+  getAudioUrl,
+} from "../voice/services/voiceApi";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
@@ -29,8 +33,15 @@ const LANGUAGES = [
   { code: "hi", label: "Hindi" },
   { code: "kn", label: "Kannada" },
   { code: "mr", label: "Marathi" },
+  { code: "bn", label: "Bengali" },
   { code: "ta", label: "Tamil" },
   { code: "te", label: "Telugu" },
+  { code: "ml", label: "Malayalam" },
+  { code: "gu", label: "Gujarati" },
+  { code: "pa", label: "Punjabi" },
+  { code: "or", label: "Odia" },
+  { code: "as", label: "Assamese" },
+  { code: "bho", label: "Bhojpuri" },
 ];
 
 function formatText(value) {
@@ -138,8 +149,15 @@ function getSpeechLanguage(language) {
     hi: "hi-IN",
     kn: "kn-IN",
     mr: "mr-IN",
+    bn: "bn-IN",
     ta: "ta-IN",
     te: "te-IN",
+    ml: "ml-IN",
+    gu: "gu-IN",
+    pa: "pa-IN",
+    or: "or-IN",
+    as: "as-IN",
+    bho: "bho-IN",
   };
 
   return mapping[language] || "en-IN";
@@ -178,10 +196,14 @@ export default function OCRScannerPage() {
   const [language, setLanguage] = useState("en");
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [voiceAudioUrl, setVoiceAudioUrl] = useState("");
 
   // Only trust medicine-specific information when the backend explicitly
   // reports medicine_found: true.
   const medicineVerified = result?.medicine_found === true;
+  const medicine = medicineVerified
+    ? result?.medicine || result?.matched_medicine || null
+    : null;
 
   const brandVerified =
     medicineVerified &&
@@ -192,10 +214,6 @@ export default function OCRScannerPage() {
     medicineVerified &&
     (result?.match_type === "verified_generic_strength_brand_unverified" ||
       medicine?.data_status === "generic_strength_verified_brand_unverified");
-
-  const medicine = medicineVerified
-    ? result?.medicine || result?.matched_medicine || null
-    : null;
 
   const extractedText =
     formatText(
@@ -695,112 +713,116 @@ export default function OCRScannerPage() {
     setResult(null);
     setError("");
     setCameraError("");
+    setVoiceAudioUrl("");
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   }
 
-  async function translateText(text, targetLanguage) {
-    if (!text || targetLanguage === "en") {
-      return text;
-    }
-
-    const url =
-      `https://api.mymemory.translated.net/get` +
-      `?q=${encodeURIComponent(text.slice(0, 4500))}` +
-      `&langpair=en|${encodeURIComponent(targetLanguage)}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new Error("Translation service is unavailable.");
-    }
-
-    const data = await response.json();
-
-    return data?.responseData?.translatedText || text;
-  }
-
   async function speakText() {
-    if (
-      typeof window === "undefined" ||
-      !window.speechSynthesis ||
-      typeof window.SpeechSynthesisUtterance === "undefined"
-    ) {
-      setError("Voice assistance is not supported by this browser.");
-      return;
-    }
-
     if (isSpeaking) {
-      window.speechSynthesis.cancel();
+      const audio = document.getElementById("ocr-voice-audio");
+      if (audio) {
+        audio.pause();
+      } else if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
       setIsSpeaking(false);
       return;
-    }
-
-    let speechText;
-
-    if (!medicineVerified) {
-      speechText =
-        "Medicine identity could not be verified. The following is only text extracted from the package, not confirmed medicine information. " +
-        extractedText +
-        " Please confirm the medicine with a pharmacist before making any health decision.";
-    } else {
-      speechText = [
-        medicineName ? `Medicine: ${medicineName}.` : "",
-        medicineInformation
-          ? `Medicine information: ${medicineInformation}.`
-          : "",
-        sideEffects.length ? `Side effects: ${sideEffects.join(", ")}.` : "",
-        warnings.length ? `Warnings: ${warnings.join(". ")}` : "",
-        interactions.length
-          ? `Drug interactions: ${interactions.join(". ")}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join(" ");
-
-      if (!speechText) {
-        speechText = extractedText;
-      }
     }
 
     try {
       setIsTranslating(true);
+      setError("");
 
-      if (language !== "en") {
-        speechText = await translateText(speechText, language);
-      }
+      const voiceName = medicineVerified
+        ? (medicineName || composition || "Verified medicine")
+        : "Unverified OCR medicine package";
 
-      const utterance = new SpeechSynthesisUtterance(speechText);
+      const voiceDescription = medicineVerified
+        ? medicineInformation
+        : "Medicine identity could not be verified. The following OCR text was extracted. " +
+          extractedText.slice(0, 350);
 
-      utterance.lang = getSpeechLanguage(language);
-      utterance.rate = 0.9;
-      utterance.pitch = 1;
+      const data = await generateVoiceExplanation(
+        voiceName,
+        language,
+        {
+          composition,
+          description: voiceDescription,
+          sideEffects: sideEffects,
+          warnings: warnings,
+        },
+      );
 
-      utterance.onstart = () => {
-        setIsSpeaking(true);
-        setIsTranslating(false);
-      };
+      const audioUrl = getAudioUrl(data.audio_file);
+      setVoiceAudioUrl(audioUrl);
 
-      utterance.onend = () => {
-        setIsSpeaking(false);
-      };
+      setTimeout(() => {
+        const audio = document.getElementById("ocr-voice-audio");
+        if (!audio) {
+          setError("Unable to play the generated voice.");
+          return;
+        }
 
-      utterance.onerror = () => {
-        setIsSpeaking(false);
-        setIsTranslating(false);
-        setError("Unable to play the medicine information.");
-      };
+        audio.onended = () => setIsSpeaking(false);
+        audio.onerror = () => {
+          setIsSpeaking(false);
+          setError("Unable to play the generated voice.");
+        };
 
-      window.speechSynthesis.speak(utterance);
+        audio.play()
+          .then(() => setIsSpeaking(true))
+          .catch(() => {
+            setIsSpeaking(false);
+            setError("The browser blocked audio playback.");
+          });
+      }, 100);
     } catch (speechError) {
       console.error("Voice error:", speechError);
-
-      setIsSpeaking(false);
       setIsTranslating(false);
+      setIsSpeaking(false);
 
-      setError("Unable to prepare voice assistance.");
+      if (
+        typeof window !== "undefined" &&
+        window.speechSynthesis &&
+        typeof window.SpeechSynthesisUtterance !== "undefined"
+      ) {
+        const fallbackText = medicineVerified
+          ? [
+              medicineName ? `Medicine: ${medicineName}.` : "",
+              medicineInformation
+                ? `Information: ${medicineInformation}.`
+                : "",
+              sideEffects.length
+                ? `Side effects: ${sideEffects.join(", ")}.`
+                : "",
+              warnings.length
+                ? `Warnings: ${warnings.join(". ")}.`
+                : "",
+            ].filter(Boolean).join(" ")
+          : `Medicine identity could not be verified. ${extractedText.slice(0, 350)}`;
+
+        const utterance = new SpeechSynthesisUtterance(fallbackText);
+        utterance.lang = getSpeechLanguage(language);
+        utterance.rate = 0.9;
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => setIsSpeaking(false);
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          setError("Voice playback is unavailable for this language.");
+        };
+        window.speechSynthesis.speak(utterance);
+        setError("");
+      } else {
+        setError(
+          speechError.message ||
+          "Unable to generate voice in this language.",
+        );
+      }
+    } finally {
+      setIsTranslating(false);
     }
   }
 
@@ -1384,7 +1406,11 @@ export default function OCRScannerPage() {
 
                 <select
                   value={language}
-                  onChange={(event) => setLanguage(event.target.value)}
+                  onChange={(event) => {
+                    setLanguage(event.target.value);
+                    setVoiceAudioUrl("");
+                    setIsSpeaking(false);
+                  }}
                   className="ocr-language-select"
                 >
                   {LANGUAGES.map((item) => (
@@ -1417,6 +1443,17 @@ export default function OCRScannerPage() {
                     </>
                   )}
                 </button>
+
+                {voiceAudioUrl && (
+                  <audio
+                    id="ocr-voice-audio"
+                    controls
+                    preload="metadata"
+                    className="ocr-voice-audio"
+                  >
+                    <source src={voiceAudioUrl} type="audio/mpeg" />
+                  </audio>
+                )}
 
                 <p className="ocr-small-note">
                   Voice playback uses your browser's speech synthesis support.

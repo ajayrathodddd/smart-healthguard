@@ -206,10 +206,15 @@ def clean_side_effects(side_effects: str) -> str:
     if len(parts) == 2:
         return f"{parts[0]} and {parts[1]}"
 
+    short_parts = parts[:5]
+
+    if len(short_parts) == 1:
+        return short_parts[0]
+
     return (
-        ", ".join(parts[:-1])
+        ", ".join(short_parts[:-1])
         + ", and "
-        + parts[-1]
+        + short_parts[-1]
     )
 
 
@@ -221,7 +226,7 @@ def build_explanation(
     side_effects: str = "",
     warnings: str = "",
 ) -> str:
-    """Build a fuller, source-based educational explanation for voice playback."""
+    """Build a short, source-based educational explanation for voice playback."""
 
     medicine_name = clean_text(medicine_name)
     composition = clean_text(composition)
@@ -232,63 +237,44 @@ def build_explanation(
         description=description,
     )
 
-    parts = [
-        f"Medicine information: {medicine_name or 'Medicine name not verified'}."
+    description_sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", description)
+        if item.strip()
     ]
+    short_description = " ".join(description_sentences[:2])[:350]
 
-    if composition:
-        parts.append(f"Composition: {composition}.")
-    else:
-        parts.append("Composition: Not available in the retrieved information.")
-
-    if description:
-        parts.append(
-            "Available medicine description: "
-            + description
-        )
-    else:
-        parts.append(
-            "Purpose and how the medicine works: "
-            "Not available in the retrieved information. "
-            "Do not assume these details without a verified source."
-        )
-
-    if side_effects_text:
-        parts.append(
-            "Reported side effects: " + side_effects_text
-        )
-    else:
-        parts.append(
-            "Side effects: No side-effect information was returned "
-            "by the available data source."
-        )
-
-    if warnings:
-        parts.append(
-            "Warnings and precautions: " + clean_text(warnings)
-        )
-    elif safety_summary:
-        parts.append(
-            "Warnings and precautions: " + safety_summary
-        )
-    else:
-        parts.append(
-            "Warnings and precautions: No warning information was "
-            "returned by the available data source."
-        )
-
-    parts.append(
-        "Drug interactions: Interaction information was not supplied "
-        "to this voice explanation. Check the verified medicine record "
-        "or ask a pharmacist about possible interactions."
+    warning_text = (
+        clean_text(warnings)
+        or safety_summary
+        or "No warning information was returned by the available data source."
     )
+    warning_sentences = [
+        item.strip()
+        for item in re.split(r"(?<=[.!?])\s+", warning_text)
+        if item.strip()
+    ]
+    short_warnings = " ".join(warning_sentences[:2])[:350]
 
-    parts.append(
-        "Important: This is educational information, not a diagnosis "
-        "or a prescription. Do not start, stop, or change a medicine "
-        "based only on this explanation. Ask a qualified healthcare "
-        "professional for advice."
-    )
+    parts = [
+        f"Medicine information: {medicine_name or 'Medicine name not verified'}.",
+        f"Composition: {composition or 'Not available in the retrieved information'}.",
+        "Available medicine description: "
+        + (
+            short_description
+            or "Purpose and how the medicine works are not available in the retrieved information."
+        ),
+        "Reported side effects: "
+        + (
+            side_effects_text
+            if side_effects_text
+            else "No side-effect information was returned by the available data source."
+        )
+        + " Warnings and precautions: "
+        + short_warnings,
+        "Drug interactions: Ask a pharmacist or healthcare professional about possible interactions. "
+        "This is educational information, not a diagnosis or prescription.",
+    ]
 
     return " ".join(parts)
 
@@ -310,23 +296,33 @@ async def translate_explanation(
             f"Unsupported translation language: {language}"
         )
 
-    translator = Translator()
+    last_error = None
 
-    translated_result = await translator.translate(
-        explanation,
-        src="en",
-        dest=translator_code,
+    for attempt in range(3):
+        try:
+            translator = Translator()
+            translated_result = await translator.translate(
+                explanation,
+                src="en",
+                dest=translator_code,
+            )
+            translated_text = str(
+                getattr(translated_result, "text", "")
+            ).strip()
+
+            if translated_text:
+                return translated_text
+
+            last_error = "Translation returned empty text."
+        except Exception as error:
+            last_error = str(error)
+            await asyncio.sleep(0.4 * (attempt + 1))
+
+    print(
+        "[HealthGuard Voice] Translation fallback to English:",
+        last_error,
     )
-
-    translated_text = translated_result.text
-
-    if not translated_text:
-
-        raise ValueError(
-            "Translation returned empty text."
-        )
-
-    return translated_text
+    return explanation
 
 
 async def generate_edge_audio(

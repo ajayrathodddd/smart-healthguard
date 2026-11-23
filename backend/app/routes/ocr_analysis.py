@@ -700,8 +700,8 @@ async def build_generic_strength_verified_result(
             print("[HealthGuard] OCR openFDA enrichment failed:", error)
 
     enriched = merge_medicine_information(
-        {},
         medicine or {},
+        {},
         fda_profile,
     )
 
@@ -800,6 +800,38 @@ async def find_exact_generic_strength_information(
         "[HealthGuard OCR] Exact generic-strength lookup:",
         requested_identity,
     )
+
+    # Verify against the Indian medicine dataset before external sources.
+    # This covers medicines such as ANALGIN 500MG TABLET (Metamizole 500 mg)
+    # that may not have a matching openFDA/RxNorm record.
+    try:
+        local_medicine = await get_real_medicine_information(
+            requested_identity
+        )
+
+        if local_medicine:
+            local_profile_matches = profile_matches_identity(
+                local_medicine,
+                {
+                    "brand_name": "",
+                    "generic_name": generic,
+                    "strength": strength,
+                    "dosage_form": dosage_form,
+                },
+            )
+
+            if local_profile_matches:
+                print(
+                    "[HealthGuard OCR] Indian dataset "
+                    "generic-strength match found:",
+                    requested_identity,
+                )
+                return local_medicine
+    except Exception as local_error:
+        print(
+            "[HealthGuard OCR] Indian dataset exact "
+            f"lookup failed: {local_error}",
+        )
 
     # ========================================================
     # Skip the full medicine service here.

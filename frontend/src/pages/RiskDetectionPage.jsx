@@ -201,7 +201,13 @@ export default function RiskDetectionPage() {
   const indicators = riskAssessment?.indicators || [];
   const verificationChecks = riskAssessment?.verification_checks || [];
   const safetyInformation = riskAssessment?.safety_information || [];
-  const sources = medicine?.source || [];
+  const sources = Array.isArray(medicine?.information_sources)
+    ? medicine.information_sources
+    : Array.isArray(medicine?.sources)
+      ? medicine.sources
+      : Array.isArray(medicine?.source)
+        ? medicine.source
+        : [];
 
   return (
     <div className="risk-page">
@@ -433,21 +439,34 @@ export default function RiskDetectionPage() {
 
               <div className="risk-info-item">
                 <span>Medicine Type</span>
-
-                <strong>{formatText(medicine.indian_medicine_type)}</strong>
+                <strong>
+                  {formatText(
+                    medicine.indian_medicine_type ||
+                      medicine.dosage_form ||
+                      medicine.medicine_type,
+                  )}
+                </strong>
               </div>
 
               <div className="risk-info-item">
                 <span>Pack Size</span>
-
-                <strong>{formatText(medicine.indian_pack_size)}</strong>
+                <strong>
+                  {formatText(
+                    medicine.indian_pack_size ||
+                      medicine.pack_size ||
+                      medicine.package_size,
+                  )}
+                </strong>
               </div>
 
               <div className="risk-info-item">
                 <span>Discontinued Status</span>
 
                 <strong>
-                  {String(medicine.indian_discontinued).toUpperCase() === "TRUE"
+                  {String(
+                    medicine.indian_discontinued ??
+                      medicine.is_discontinued,
+                  ).toUpperCase() === "TRUE"
                     ? "Marked discontinued"
                     : "Not marked discontinued"}
                 </strong>
