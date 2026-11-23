@@ -1472,6 +1472,7 @@ async def get_real_medicine_information(
             ),
             "sources": [fda_source],
             "information_sources": [fda_source],
+            "data_scope": "generic",
             "data_status": "available",
         }
 
@@ -1520,6 +1521,7 @@ async def get_real_medicine_information(
             "information_sources": [
                 "Generic metamizole information (not brand-specific)"
             ],
+            "data_scope": "generic",
             "data_status": "available",
         }
 

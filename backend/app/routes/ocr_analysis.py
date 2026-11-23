@@ -750,6 +750,7 @@ async def build_generic_strength_verified_result(
 
     generic_name = identity.get("generic_name", "")
     fda_profile = {}
+    information_profile = {}
 
     if generic_name:
         try:
@@ -759,8 +760,38 @@ async def build_generic_strength_verified_result(
         except Exception as error:
             print("[HealthGuard] OCR openFDA enrichment failed:", error)
 
+    if generic_name.strip().lower() in {
+        "paracetamol",
+        "acetaminophen",
+        "metamizole",
+        "metamizol",
+        "dipyrone",
+    }:
+        generic_query = " ".join(
+            part
+            for part in (
+                generic_name,
+                str(identity.get("strength") or ""),
+            )
+            if part
+        )
+        try:
+            generic_profile = await get_real_medicine_information(
+                generic_query
+            )
+            if (
+                generic_profile
+                and generic_profile.get("data_scope") == "generic"
+            ):
+                information_profile = generic_profile
+        except Exception as error:
+            print(
+                "[HealthGuard] OCR generic information lookup failed:",
+                error,
+            )
+
     enriched = merge_medicine_information(
-        medicine or {},
+        information_profile,
         {},
         fda_profile,
     )
