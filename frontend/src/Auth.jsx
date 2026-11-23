@@ -7,6 +7,8 @@ import {
   User,
   ArrowLeft,
   ShieldCheck,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 
 import "./Auth.css";
@@ -27,6 +29,8 @@ function Auth() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [rememberMe, setRememberMe] = useState(false);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
@@ -157,11 +161,22 @@ function Auth() {
   const switchMode = (nextMode) => {
     clearMessages();
     setPassword("");
+    setShowPassword(false);
     setMode(nextMode);
   };
 
   return (
     <div className="auth-container">
+      <div className="auth-mobile-brand" aria-label="Smart HealthGuard">
+        <div className="auth-mobile-shield">
+          <ShieldCheck size={24} />
+        </div>
+        <div>
+          <strong>Smart HealthGuard <span>AI</span></strong>
+          <small>Medicine Safety &amp; Health Awareness</small>
+        </div>
+      </div>
+
       <div className="auth-layout">
 
         <section className="auth-visual">
@@ -193,10 +208,8 @@ function Auth() {
         <section className="auth-card">
           <div className="auth-brand">
             <div className="auth-logo">
-              <Activity size={27} />
+              <ShieldCheck size={31} />
             </div>
-            <h2>Smart HealthGuard</h2>
-            <p>Your smart companion for medicine information and health awareness</p>
           </div>
 
           {mode !== "forgot" && (
@@ -227,10 +240,11 @@ function Auth() {
               </p>
 
               <form className="auth-form" onSubmit={handleForgotPassword}>
-                <label>Email address</label>
+                <label htmlFor="auth-email">Email address</label>
                 <div className="auth-input-wrapper">
                   <Mail size={19} />
                   <input
+                    id="auth-email"
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -257,12 +271,12 @@ function Auth() {
             </>
           ) : (
             <>
-              <h3>{mode === "signup" ? "Create your account" : "Welcome back 👋"}</h3>
+              <h3>{mode === "signup" ? "Create Account" : "Welcome Back!"}</h3>
 
               <p className="auth-description">
                 {mode === "signup"
-                  ? "Create your account and get started with HealthGuard."
-                  : "Log in to continue to your dashboard."}
+                  ? "Create your Smart HealthGuard account"
+                  : "Login to your Smart HealthGuard account"}
               </p>
 
               <form
@@ -271,24 +285,26 @@ function Auth() {
               >
                 {mode === "signup" && (
                   <>
-                    <label>Full name</label>
+                    <label htmlFor="auth-name">Full Name</label>
                     <div className="auth-input-wrapper">
                       <User size={19} />
                       <input
+                        id="auth-name"
                         type="text"
                         value={name}
                         onChange={(e) => setName(e.target.value)}
-                        placeholder="Enter your full name"
+                        placeholder="Full Name"
                         required
                       />
                     </div>
                   </>
                 )}
 
-                <label>Email address</label>
+                <label htmlFor="auth-email">Email address</label>
                 <div className="auth-input-wrapper">
                   <Mail size={19} />
                   <input
+                    id="auth-email"
                     type="email"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
@@ -297,21 +313,38 @@ function Auth() {
                   />
                 </div>
 
-                <label>Password</label>
+                <label htmlFor="auth-password">Password</label>
                 <div className="auth-input-wrapper">
                   <LockKeyhole size={19} />
                   <input
-                    type="password"
+                    id="auth-password"
+                    type={showPassword ? "text" : "password"}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Enter your password"
                     minLength={6}
                     required
                   />
+                  <button
+                    type="button"
+                    className="auth-password-toggle"
+                    onClick={() => setShowPassword((current) => !current)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                  >
+                    {showPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+                  </button>
                 </div>
 
                 {mode === "login" && (
-                  <div className="auth-forgot">
+                  <div className="auth-login-options">
+                    <label className="auth-remember">
+                      <input
+                        type="checkbox"
+                        checked={rememberMe}
+                        onChange={(event) => setRememberMe(event.target.checked)}
+                      />
+                      <span>Remember me</span>
+                    </label>
                     <button type="button" onClick={() => switchMode("forgot")}>
                       Forgot password?
                     </button>
