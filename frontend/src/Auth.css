@@ -16,7 +16,7 @@
   font-family: 'Inter', sans-serif;
   background:
     linear-gradient(90deg, rgba(0, 74, 99, 0.04), rgba(0, 74, 99, 0.1)),
-    url("/auth-bg.jpeg") center center / cover no-repeat;
+    url("/auth-bg.jpeg") left center / cover no-repeat;
   overflow-x: hidden;
 }
 
@@ -28,7 +28,7 @@
   position: relative;
   width: 100%;
   max-width: 1320px;
-  min-height: calc(100vh - 90px);
+  min-height: calc(100vh - 120px);
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: center;
@@ -114,16 +114,21 @@
 .auth-card {
   position: absolute;
   right: clamp(20px, 5.5vw, 82px);
-  top: 50%;
+  top: calc(50% + 34px);
   transform: translateY(-50%);
   width: 100%;
   max-width: 430px;
   margin: 0;
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 22px 36px 20px;
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(242, 253, 254, 0.82);
   border: 1px solid rgba(149, 220, 224, 0.75);
   border-radius: 24px;
   box-shadow: 0 22px 55px rgba(0, 55, 75, 0.22);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
   animation: authAppear 0.6s ease;
 }
 
@@ -497,11 +502,11 @@
 @media (max-width: 950px) {
   .auth-container {
     padding: 18px;
-    background-position: 42% center;
+    background-position: left center;
   }
 
   .auth-layout {
-    min-height: calc(100vh - 70px);
+    min-height: calc(100vh - 140px);
   }
 
   .auth-visual {
@@ -529,6 +534,59 @@
     position: absolute;
     right: 24px;
     max-width: 430px;
+  }
+}
+
+@media (min-width: 521px) and (max-height: 700px) {
+  .auth-container {
+    height: 100dvh;
+    min-height: 100dvh;
+    padding: 12px 5vw;
+    overflow: hidden;
+  }
+
+  .auth-layout {
+    min-height: 0;
+  }
+
+  .auth-card {
+    top: 50%;
+    max-height: calc(100dvh - 24px);
+    padding: 14px 30px 12px;
+  }
+
+  .auth-brand {
+    margin-bottom: 8px;
+  }
+
+  .auth-logo {
+    width: 58px;
+    height: 58px;
+  }
+
+  .auth-form {
+    gap: 5px;
+  }
+
+  .auth-input-wrapper {
+    height: 46px;
+  }
+
+  .auth-primary-button,
+  .auth-google-button {
+    min-height: 48px;
+  }
+
+  .auth-divider {
+    margin: 8px 0;
+  }
+
+  .auth-switch {
+    margin: 8px 0 2px;
+  }
+
+  .copyright-footer {
+    display: none;
   }
 }
 
