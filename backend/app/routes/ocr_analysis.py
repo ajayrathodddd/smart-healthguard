@@ -733,6 +733,9 @@ def profile_matches_identity(
     if generic and strength:
         return generic_match and strength_match
 
+    if generic:
+        return generic_match
+
     return False
 
 # ============================================================
@@ -827,7 +830,11 @@ async def build_generic_strength_verified_result(
             "information_sources",
             medicine.get("information_sources", {}),
         ),
-        "data_status": "generic_strength_verified_brand_unverified",
+        "data_status": (
+            "generic_strength_verified_brand_unverified"
+            if identity.get("strength")
+            else "generic_verified_brand_unverified"
+        ),
         "match_score": medicine.get("match_score", 0),
         "matched_query": medicine.get("matched_query", ""),
         "active_ingredient": generic_name,
@@ -835,7 +842,11 @@ async def build_generic_strength_verified_result(
         "ocr_generic_name": generic_name,
         "ocr_strength": identity.get("strength", ""),
         "ocr_dosage_form": identity.get("dosage_form", ""),
-        "ocr_match_type": "verified_generic_strength_brand_unverified",
+        "ocr_match_type": (
+            "verified_generic_strength_brand_unverified"
+            if identity.get("strength")
+            else "verified_generic"
+        ),
     }
 
 
@@ -1468,10 +1479,16 @@ async def find_medicine_from_identity(
                     medicine_info,
                     generic_identity,
                 ):
+                    safe_medicine = (
+                        await build_generic_strength_verified_result(
+                            medicine_info,
+                            generic_identity,
+                        )
+                    )
                     return {
                         "matched_text": generic,
                         "medicine_information": (
-                            medicine_info
+                            safe_medicine
                         ),
                         "match_type": (
                             "verified_generic"
@@ -1770,6 +1787,28 @@ async def analyze_medicine_image(
                         "has not been returned."
                     ),
                     "medicine": safe_medicine,
+                }
+
+            if (
+                generic_verified
+                and not strength_verified
+                and matched_medicine.get("match_type") == "verified_generic"
+            ):
+                return {
+                    "success": True,
+                    "medicine_found": True,
+                    "filename": file.filename,
+                    "extracted_text": extracted_text,
+                    "candidates": candidates,
+                    "ocr_identity": identity,
+                    "matched_text": identity.get("generic_name", ""),
+                    "match_type": "verified_generic",
+                    "verification_message": (
+                        "The active ingredient was matched. The package brand "
+                        "and strength were not verified, so only general "
+                        "ingredient information is shown."
+                    ),
+                    "medicine": medicine,
                 }
 
             # =================================================

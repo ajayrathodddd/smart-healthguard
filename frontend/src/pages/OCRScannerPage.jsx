@@ -215,6 +215,11 @@ export default function OCRScannerPage() {
     (result?.match_type === "verified_generic_strength_brand_unverified" ||
       medicine?.data_status === "generic_strength_verified_brand_unverified");
 
+  const genericVerified =
+    medicineVerified &&
+    (result?.match_type === "verified_generic" ||
+      medicine?.data_status === "generic_verified_brand_unverified");
+
   const extractedText =
     formatText(
       result?.extracted_text ||
@@ -1292,7 +1297,9 @@ export default function OCRScannerPage() {
             </div>
 
             {hasOcrIdentity &&
-              (!medicineVerified || genericStrengthVerified) && (
+              (!medicineVerified ||
+                genericStrengthVerified ||
+                genericVerified) && (
               <div className="ocr-panel" style={{ marginBottom: "18px" }}>
                 <div className="ocr-panel-body">
                   <div className="ocr-result-label">
@@ -1301,6 +1308,8 @@ export default function OCRScannerPage() {
                   <p style={{ margin: "8px 0 14px", color: "#b7791f" }}>
                     {genericStrengthVerified
                       ? "Ingredient and strength are verified. Brand and manufacturer below are OCR-only and not independently verified."
+                      : genericVerified
+                        ? "Ingredient is verified. Brand and strength are not verified; only general ingredient information is shown."
                       : "Unverified OCR text - these details have not been confirmed against a trusted medicine source."}
                   </p>
                   {[
@@ -1347,6 +1356,8 @@ export default function OCRScannerPage() {
                         ? "BRAND VERIFIED"
                         : genericStrengthVerified
                           ? "INGREDIENT + STRENGTH VERIFIED"
+                          : genericVerified
+                            ? "INGREDIENT VERIFIED (STRENGTH UNKNOWN)"
                           : "MEDICINE NOT VERIFIED"}
                     </div>
 
