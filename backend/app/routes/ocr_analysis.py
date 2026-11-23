@@ -103,6 +103,7 @@ KNOWN_GENERIC_NAMES = [
     "cetirizine",
     "metformin",
     "omeprazole",
+    "itraconazole",
     "metamizole",
     "metamizol",
     "dipyrone",
@@ -1383,19 +1384,52 @@ async def find_medicine_from_identity(
             )
 
             if medicine_info:
-                if profile_matches_identity(
-                    medicine_info,
-                    identity,
-                ):
-                    return {
-                        "matched_text": brand,
-                        "medicine_information": (
-                            medicine_info
-                        ),
-                        "match_type": (
-                            "verified_ocr_identity"
-                        ),
+                if brand and not generic:
+                    database_generic = re.sub(
+                        r"\s*\(\s*\d+(?:\.\d+)?\s*(?:mg|mcg|g|ml|iu)\s*\)",
+                        "",
+                        str(medicine_info.get("generic_name") or ""),
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    generic_identity = {
+                        **identity,
+                        "brand_name": "",
+                        "generic_name": database_generic,
                     }
+                    if (
+                        database_generic
+                        and normalize_generic_text(brand)
+                        == normalize_generic_text(database_generic)
+                        and profile_matches_identity(
+                            medicine_info,
+                            generic_identity,
+                        )
+                    ):
+                        identity["brand_name"] = ""
+                        identity["generic_name"] = database_generic
+                        brand = ""
+                        generic = database_generic
+
+                if profile_matches_identity(medicine_info, identity):
+                    if not brand and generic and not identity.get("strength"):
+                        safe_medicine = (
+                            await build_generic_strength_verified_result(
+                                medicine_info,
+                                identity,
+                            )
+                        )
+                        return {
+                            "matched_text": generic,
+                            "medicine_information": safe_medicine,
+                            "match_type": "verified_generic",
+                        }
+
+                    if brand or identity.get("strength"):
+                        return {
+                            "matched_text": brand or generic,
+                            "medicine_information": medicine_info,
+                            "match_type": "verified_ocr_identity",
+                        }
 
                 database_brand = str(
                     medicine_info.get("brand_name", "")
@@ -1413,11 +1447,12 @@ async def find_medicine_from_identity(
                     )
                     return None
 
-            print(
-                "[HealthGuard OCR] Brand was not "
-                "independently verified:",
-                brand,
-            )
+            if brand:
+                print(
+                    "[HealthGuard OCR] Brand was not "
+                    "independently verified:",
+                    brand,
+                )
 
         except Exception as error:
             print(
