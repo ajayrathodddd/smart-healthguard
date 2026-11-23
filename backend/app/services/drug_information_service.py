@@ -1415,6 +1415,66 @@ async def get_real_medicine_information(
         },
     }
 
+    normalized_paracetamol_query = re.sub(
+        r"\s+",
+        " ",
+        normalized_query,
+    )
+    paracetamol_match = re.fullmatch(
+        r"(?:paracetamol|acetaminophen)"
+        r"(?:\s+(\d+(?:\.\d+)?\s*(?:mg|mcg|g)))?",
+        normalized_paracetamol_query,
+        re.IGNORECASE,
+    )
+    if paracetamol_match:
+        strength = re.sub(
+            r"\s+",
+            " ",
+            paracetamol_match.group(1) or "",
+        ).strip()
+        fda_source = (
+            "FDA acetaminophen safety information: "
+            "https://www.fda.gov/drugs/safe-use-over-counter-pain-relievers-and-fever-reducers/acetaminophen"
+        )
+        common_profiles[normalized_query] = {
+            "name": f"Paracetamol {strength}".strip(),
+            "brand_name": "",
+            "generic_name": "Paracetamol",
+            "active_ingredient": "Paracetamol",
+            "manufacturer": "",
+            "strength": strength,
+            "dosage_form": "",
+            "route": "",
+            "medicine_description": (
+                "Paracetamol (acetaminophen) is used for temporary relief "
+                "of pain and reduction of fever."
+            ),
+            "side_effects": [
+                "Rare but serious skin reactions (rash/blisters/peeling skin). "
+                "Stop use and seek medical attention if this occurs."
+            ],
+            "warnings": [
+                "Follow the product label or your healthcare professional's directions; do not exceed them.",
+                "Do not use more than one medicine containing paracetamol/acetaminophen at the same time.",
+                "Taking too much can cause severe liver damage or liver failure. Seek emergency help if an overdose is suspected.",
+                "Ask a healthcare professional before use if you have liver disease or regularly drink alcohol.",
+                "Consult a healthcare professional before using during pregnancy.",
+            ],
+            "contraindications": [
+                "Do not use paracetamol-containing products again if you previously had a serious skin reaction to acetaminophen."
+            ],
+            "drug_interactions": [
+                "Avoid accidental duplicate use: some combination products also contain paracetamol. Check labels and ask a pharmacist if unsure."
+            ],
+            "pregnancy": (
+                "Consult a healthcare professional before using any medicine, "
+                "including paracetamol, during pregnancy."
+            ),
+            "sources": [fda_source],
+            "information_sources": [fda_source],
+            "data_status": "available",
+        }
+
     normalized_metamizole_query = re.sub(
         r"\s+",
         " ",
