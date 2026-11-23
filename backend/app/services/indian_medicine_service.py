@@ -1,6 +1,14 @@
 
 import csv
+import heapq
+import itertools
+import json
+import os
 import re
+import sqlite3
+import tempfile
+import threading
+
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -23,9 +31,13 @@ POSSIBLE_DATA_FILES = [
     SERVICE_FILE.parents[3] / "app" / "data" / "updated_indian_medicine_data.csv",
 ]
 
-_MEDICINE_ROWS: Optional[List[Dict[str, str]]] = None
+DB_PATH = Path(tempfile.gettempdir()) / "smart_healthguard_medicines.sqlite3"
+
+_DB_LOCK = threading.Lock()
 _DATA_FILE: Optional[Path] = None
-_SEARCH_INDEX = None
+
+MAX_CANDIDATES = 1000
+BATCH_SIZE = 1000
 
 
 # ============================================================
@@ -39,7 +51,7 @@ def normalize_text(value: str) -> str:
     value = str(value).lower().strip()
     value = value.replace("_", " ")
     value = value.replace("/", " ")
-    value = value.replace("\\\\", " ")
+    value = value.replace("\\", " ")
     value = value.replace(",", " ")
     value = value.replace("(", " ")
     value = value.replace(")", " ")
@@ -125,7 +137,7 @@ def _get_value(row: Dict[str, str], possible_names: List[str]) -> str:
     for name in possible_names:
         value = row.get(name)
         if value:
-            return value
+            return str(value)
 
     return ""
 
@@ -242,24 +254,85 @@ def _query_ingredient(query: str) -> str:
 
 
 # ============================================================
-# LOAD DATASET
+# SQLITE DATABASE BUILDER
 # ============================================================
 
-def _load_medicine_rows() -> List[Dict[str, str]]:
-    global _MEDICINE_ROWS
-
-    if _MEDICINE_ROWS is not None:
-        return _MEDICINE_ROWS
-
-    data_file = _find_data_file()
-
-    if data_file is None:
-        _MEDICINE_ROWS = []
-        return []
-
-    rows = []
+def _database_is_current(data_file: Path) -> bool:
+    if not DB_PATH.exists():
+        return False
 
     try:
+        connection = sqlite3.connect(str(DB_PATH))
+
+        metadata = dict(
+            connection.execute(
+                "SELECT key, value FROM metadata"
+            ).fetchall()
+        )
+
+        connection.close()
+
+        return (
+            metadata.get("source_path") == str(data_file.resolve())
+            and metadata.get("source_size") == str(data_file.stat().st_size)
+            and metadata.get("source_mtime") == str(data_file.stat().st_mtime)
+            and metadata.get("ready") == "1"
+        )
+
+    except Exception:
+        return False
+
+
+def _build_sqlite_database(data_file: Path) -> None:
+    temporary_path = DB_PATH.with_name(
+        f"{DB_PATH.stem}_{os.getpid()}.tmp.sqlite3"
+    )
+
+    if temporary_path.exists():
+        temporary_path.unlink()
+
+    connection = sqlite3.connect(str(temporary_path))
+
+    try:
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-8192")
+
+        connection.execute("""
+            CREATE TABLE medicines (
+                id INTEGER PRIMARY KEY,
+                data_json TEXT NOT NULL,
+                name_norm TEXT,
+                name_compact TEXT,
+                composition_1 TEXT,
+                composition_2 TEXT,
+                searchable TEXT
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        insert_sql = """
+            INSERT INTO medicines (
+                data_json,
+                name_norm,
+                name_compact,
+                composition_1,
+                composition_2,
+                searchable
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+
+        batch = []
+        total = 0
+
         with data_file.open(
             "r",
             encoding="utf-8-sig",
@@ -267,84 +340,166 @@ def _load_medicine_rows() -> List[Dict[str, str]]:
         ) as file:
             reader = csv.DictReader(file)
 
-            for row in reader:
-                if not row:
+            for original_row in reader:
+                if not original_row:
                     continue
 
-                rows.append({
+                row = {
                     str(key).strip(): (
                         "" if value is None else str(value).strip()
                     )
-                    for key, value in row.items()
+                    for key, value in original_row.items()
                     if key is not None
-                })
+                }
 
-        _MEDICINE_ROWS = rows
+                name = _medicine_name(row)
+                composition_1 = _composition_1(row)
+                composition_2 = _composition_2(row)
 
-        print(f"Indian medicine dataset loaded: {len(rows)} rows")
+                searchable = normalize_text(
+                    f"{name} {composition_1} {composition_2}"
+                )
 
-        return rows
+                batch.append((
+                    json.dumps(row, ensure_ascii=False),
+                    normalize_text(name),
+                    compact_text(name),
+                    normalize_text(composition_1),
+                    normalize_text(composition_2),
+                    searchable,
+                ))
 
-    except Exception as error:
-        print("Failed to load Indian medicine dataset:", error)
-        _MEDICINE_ROWS = []
-        return []
+                if len(batch) >= BATCH_SIZE:
+                    connection.executemany(insert_sql, batch)
+                    total += len(batch)
+                    batch.clear()
+
+            if batch:
+                connection.executemany(insert_sql, batch)
+                total += len(batch)
+
+        connection.execute(
+            "CREATE INDEX idx_medicine_name ON medicines(name_norm)"
+        )
+        connection.execute(
+            "CREATE INDEX idx_medicine_compact ON medicines(name_compact)"
+        )
+
+        stat = data_file.stat()
+
+        connection.executemany(
+            "INSERT INTO metadata (key, value) VALUES (?, ?)",
+            [
+                ("source_path", str(data_file.resolve())),
+                ("source_size", str(stat.st_size)),
+                ("source_mtime", str(stat.st_mtime)),
+                ("ready", "1"),
+                ("total_rows", str(total)),
+            ],
+        )
+
+        connection.commit()
+        connection.close()
+
+        os.replace(temporary_path, DB_PATH)
+
+        print(
+            f"Indian medicine SQLite database created: {total} rows"
+        )
+
+    except Exception:
+        connection.close()
+
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+        raise
+
+
+def _ensure_database() -> bool:
+    data_file = _find_data_file()
+
+    if data_file is None:
+        return False
+
+    with _DB_LOCK:
+        if _database_is_current(data_file):
+            return True
+
+        try:
+            print("Preparing Indian medicine SQLite database...")
+            _build_sqlite_database(data_file)
+            return True
+
+        except Exception as error:
+            print("Failed to prepare medicine database:", error)
+            return False
 
 
 # ============================================================
-# BUILD SEARCH INDEX ONCE
+# SQLITE SEARCH HELPERS
 # ============================================================
 
-def _build_search_index(rows):
-    by_name = {}
-    by_ingredient = {}
-    by_token = {}
+def _candidate_query(
+    connection: sqlite3.Connection,
+    query: str,
+):
+    conditions = [
+        "name_norm = ?",
+        "name_compact = ?",
+    ]
 
-    for row in rows:
-        name = normalize_text(_medicine_name(row))
-        compact_name = compact_text(name)
+    parameters = [
+        query,
+        compact_text(query),
+    ]
 
-        if name:
-            by_name.setdefault(name, []).append(row)
+    requested_ingredient = _query_ingredient(query)
 
-        if compact_name and compact_name != name:
-            by_name.setdefault(compact_name, []).append(row)
+    for alias in _get_aliases(requested_ingredient):
+        if len(alias) < 2:
+            continue
 
-        ingredients = (
-            _extract_ingredient_names(_composition_1(row))
-            + _extract_ingredient_names(_composition_2(row))
-        )
+        conditions.append("composition_1 LIKE ?")
+        parameters.append(f"%{alias}%")
 
-        for ingredient in set(ingredients):
-            by_ingredient.setdefault(ingredient, []).append(row)
+        conditions.append("composition_2 LIKE ?")
+        parameters.append(f"%{alias}%")
 
-        searchable = normalize_text(
-            f"{_medicine_name(row)} "
-            f"{_composition_1(row)} "
-            f"{_composition_2(row)}"
-        )
+    for token in query.split():
+        if len(token) < 3:
+            continue
 
-        for token in set(searchable.split()):
-            if len(token) >= 3:
-                by_token.setdefault(token, []).append(row)
+        conditions.append("searchable LIKE ?")
+        parameters.append(f"%{token}%")
 
-    print("Medicine search index created.")
+    sql = """
+        SELECT data_json
+        FROM medicines
+        WHERE
+    """ + " OR ".join(conditions)
 
-    return {
-        "by_name": by_name,
-        "by_ingredient": by_ingredient,
-        "by_token": by_token,
-    }
+    return connection.execute(sql, parameters)
 
 
-def _get_search_index():
-    global _SEARCH_INDEX
+def _all_medicine_rows(connection: sqlite3.Connection):
+    return connection.execute(
+        "SELECT data_json FROM medicines"
+    )
 
-    if _SEARCH_INDEX is None:
-        rows = _load_medicine_rows()
-        _SEARCH_INDEX = _build_search_index(rows)
 
-    return _SEARCH_INDEX
+def _row_iterator(cursor):
+    while True:
+        batch = cursor.fetchmany(250)
+
+        if not batch:
+            break
+
+        for item in batch:
+            try:
+                yield json.loads(item[0])
+            except (TypeError, json.JSONDecodeError):
+                continue
 
 
 # ============================================================
@@ -364,50 +519,57 @@ def _score_medicine(query: str, row: Dict[str, str]) -> int:
     name_compact = compact_text(name)
     query_compact = compact_text(normalized_query)
 
-    score = 0
-
-    # Exact brand match
-    if name == normalized_query or (
-        query_compact and name_compact == query_compact
-    ):
-        score = max(score, 2500)
-
-    # Brand phrase matching. Exact requested brand phrases outrank generic matches.
-    requested_ingredient = _query_ingredient(normalized_query)
-    generic_aliases = _get_aliases(requested_ingredient)
-
     composition_ingredients = (
         _extract_ingredient_names(composition_1)
         + _extract_ingredient_names(composition_2)
     )
     composition_ingredients = list(dict.fromkeys(composition_ingredients))
 
-    generic_match = any(
-        alias in composition_ingredients
-        for alias in generic_aliases
-    )
+    score = 0
 
-    if len(normalized_query) >= 4:
-        if normalized_query in name:
-            score = max(score, 2200)
-        elif query_compact and query_compact in name_compact:
-            score = max(score, 2100)
+    # Exact full medicine name.
+    if name == normalized_query or (
+        query_compact and name_compact == query_compact
+    ):
+        score = 5000
 
-    # Generic ingredient matching
+    else:
+        # Exact phrase in a medicine name.
+        phrase_match = _contains_word(name, normalized_query)
+
+        # Do not give combination medicines the same score
+        # as a standalone medicine for a generic ingredient query.
+        if phrase_match and len(composition_ingredients) <= 1:
+            score = 3500
+
+        elif len(normalized_query) >= 4 and normalized_query in name:
+            score = 2200
+
+        elif (
+            query_compact
+            and len(query_compact) >= 4
+            and query_compact in name_compact
+        ):
+            score = 2000
+
+    # Ingredient matching.
+    requested_ingredient = _query_ingredient(normalized_query)
+    generic_aliases = _get_aliases(requested_ingredient)
+
     for alias in generic_aliases:
-        if alias not in composition_ingredients:
-            continue
+        for ingredient in composition_ingredients:
+            if ingredient == alias:
+                if len(composition_ingredients) == 1:
+                    score = max(score, 1500)
+                else:
+                    score = max(score, 1200)
 
-        if len(composition_ingredients) == 1:
-            score = max(score, 1500)
-        else:
-            score = max(score, 1200)
-
-    # Strength match
+    # Match requested strength.
     requested_strength = _extract_strength(query)
 
     if requested_strength:
         amount, unit = requested_strength
+
         combined = normalize_text(
             f"{name} {composition_1} {composition_2}"
         )
@@ -444,7 +606,75 @@ def _fuzzy_score(query: str, row: Dict[str, str]) -> int:
 
 
 # ============================================================
-# SEARCH MEDICINES USING INDEX
+# RESULT RANKING
+# ============================================================
+
+def _collect_top_results(
+    rows,
+    query: str,
+    limit: int,
+    fuzzy: bool = False,
+):
+    counter = itertools.count()
+    top = []
+
+    capacity = max(MAX_CANDIDATES, limit * 100)
+
+    for row in rows:
+        score = (
+            _fuzzy_score(query, row)
+            if fuzzy
+            else _score_medicine(query, row)
+        )
+
+        if fuzzy:
+            if score < 250:
+                continue
+        elif score < 800:
+            continue
+
+        item = (score, next(counter), row)
+
+        if len(top) < capacity:
+            heapq.heappush(top, item)
+        elif score > top[0][0]:
+            heapq.heapreplace(top, item)
+
+    ranked = sorted(top, key=lambda item: item[0], reverse=True)
+
+    results = []
+    seen = set()
+
+    for score, _, row in ranked:
+        unique_key = (
+            compact_text(_medicine_name(row)),
+            compact_text(_composition_1(row)),
+            compact_text(_composition_2(row)),
+        )
+
+        if not fuzzy:
+            unique_key += (
+                compact_text(_get_value(row, ["type"])),
+            )
+
+        if unique_key in seen:
+            continue
+
+        seen.add(unique_key)
+
+        results.append({
+            "score": score,
+            "medicine": row,
+        })
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+# ============================================================
+# SEARCH MEDICINES
 # ============================================================
 
 def search_indian_medicines(
@@ -461,128 +691,65 @@ def search_indian_medicines(
 
     limit = max(1, min(int(limit), 50))
 
-    index = _get_search_index()
-
-    if not index:
+    if not _ensure_database():
         return []
 
-    candidate_rows = []
-    seen_ids = set()
+    connection = None
 
-    def add_candidates(rows):
-        for row in rows:
-            row_id = id(row)
+    try:
+        connection = sqlite3.connect(str(DB_PATH))
 
-            if row_id not in seen_ids:
-                seen_ids.add(row_id)
-                candidate_rows.append(row)
+        candidate_cursor = _candidate_query(connection, query)
+        candidate_rows = _row_iterator(candidate_cursor)
 
-    # Exact brand lookup
-    compact_query = compact_text(query)
-
-    add_candidates(index["by_name"].get(query, []))
-    add_candidates(index["by_name"].get(compact_query, []))
-
-    # Ingredient lookup
-    requested_ingredient = _query_ingredient(query)
-
-    for alias in _get_aliases(requested_ingredient):
-        add_candidates(index["by_ingredient"].get(alias, []))
-
-    # Token lookup for brand phrases and fallback matching
-    query_tokens = [
-        token for token in query.split()
-        if len(token) >= 3
-    ]
-
-    for token in query_tokens:
-        add_candidates(index["by_token"].get(token, []))
-
-    # Only use full dataset as a last resort if no index candidates exist.
-    if not candidate_rows:
-        print("No indexed candidates; trying fuzzy fallback.")
-        candidate_rows = index_rows = _load_medicine_rows()
-
-    strong_results = []
-
-    for row in candidate_rows:
-        score = _score_medicine(query, row)
-
-        if score >= 800:
-            strong_results.append((score, row))
-
-    if strong_results:
-        strong_results.sort(
-            key=lambda item: item[0],
-            reverse=True,
+        strong_results = _collect_top_results(
+            candidate_rows,
+            query,
+            limit,
         )
 
-        results = []
-        seen = set()
+        if strong_results:
+            print(
+                f"Indian medicine search: "
+                f"{len(strong_results)} indexed result(s)"
+            )
+            return strong_results
 
-        for score, row in strong_results:
-            unique_key = (
-                compact_text(_medicine_name(row)),
-                compact_text(_composition_1(row)),
-                compact_text(_composition_2(row)),
-                compact_text(_get_value(row, ["type"])),
+        print("No strong indexed matches; trying fuzzy fallback.")
+
+        candidate_cursor = _candidate_query(connection, query)
+
+        fuzzy_results = _collect_top_results(
+            _row_iterator(candidate_cursor),
+            query,
+            limit,
+            fuzzy=True,
+        )
+
+        if not fuzzy_results:
+            print("Trying full SQLite fuzzy search.")
+
+            fuzzy_results = _collect_top_results(
+                _row_iterator(_all_medicine_rows(connection)),
+                query,
+                limit,
+                fuzzy=True,
             )
 
-            if unique_key in seen:
-                continue
-
-            seen.add(unique_key)
-
-            results.append({
-                "score": score,
-                "medicine": row,
-            })
-
-            if len(results) >= limit:
-                break
-
-        print(f"Indian medicine search: {len(results)} indexed result(s)")
-        return results
-
-    # Fuzzy fallback on indexed token candidates
-    fuzzy_results = []
-
-    for row in candidate_rows:
-        score = _fuzzy_score(query, row)
-
-        if score >= 250:
-            fuzzy_results.append((score, row))
-
-    fuzzy_results.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    results = []
-    seen = set()
-
-    for score, row in fuzzy_results:
-        unique_key = (
-            compact_text(_medicine_name(row)),
-            compact_text(_composition_1(row)),
-            compact_text(_composition_2(row)),
+        print(
+            f"Indian medicine search: "
+            f"{len(fuzzy_results)} fuzzy result(s)"
         )
 
-        if unique_key in seen:
-            continue
+        return fuzzy_results
 
-        seen.add(unique_key)
+    except Exception as error:
+        print("Indian medicine search failed:", error)
+        return []
 
-        results.append({
-            "score": score,
-            "medicine": row,
-        })
-
-        if len(results) >= limit:
-            break
-
-    print(f"Indian medicine search: {len(results)} fuzzy result(s)")
-    return results
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 # ============================================================
@@ -600,7 +767,7 @@ def build_indian_medicine_profile(
         "manufacturer": _manufacturer(row),
         "medicine_type": _get_value(row, ["type", "medicine_type", "drug_type"]),
         "pack_size": _get_value(row, ["pack_size_label", "pack_size", "packsize", "pack"]),
-        "price": _get_value(row, ["price(₹)", "price", "mrp", "price_inr"]),
+        "price": _get_value(row, ["price(â‚¹)", "price", "mrp", "price_inr"]),
         "is_discontinued": _get_value(row, ["Is_discontinued", "is_discontinued", "discontinued"]),
         "medicine_description": _get_value(row, ["medicine_desc", "medicine_description", "description"]),
         "side_effects": _get_value(row, ["side_effects", "side_effect", "adverse_effects"]),
@@ -626,19 +793,28 @@ def get_best_indian_medicine(
 
 
 # ============================================================
-# RELOAD DATASET AND INDEX
+# RELOAD DATASET
 # ============================================================
 
 def reload_indian_medicine_dataset() -> None:
-    global _MEDICINE_ROWS
     global _DATA_FILE
-    global _SEARCH_INDEX
 
-    _MEDICINE_ROWS = None
     _DATA_FILE = None
-    _SEARCH_INDEX = None
 
-    print("Indian medicine dataset and search index cleared.")
+    with _DB_LOCK:
+        for path in [
+            DB_PATH,
+            DB_PATH.with_name(
+                f"{DB_PATH.stem}_{os.getpid()}.tmp.sqlite3"
+            ),
+        ]:
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception as error:
+                    print("Could not remove medicine database:", error)
+
+    print("Indian medicine SQLite database cleared.")
 
 
 # ============================================================
